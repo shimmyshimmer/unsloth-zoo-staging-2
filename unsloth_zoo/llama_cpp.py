@@ -35,6 +35,7 @@ import requests
 import json
 from tqdm.auto import tqdm as ProgressBar
 from functools import lru_cache
+import hashlib
 import inspect
 import contextlib
 import importlib.util
@@ -120,11 +121,13 @@ LLAMA_CPP_DEFAULT_DIR = os.environ.get(
 
 
 def _resolve_local_convert_script():
-    """Returns absolute path to a local convert_hf_to_gguf.py if UNSLOTH_LLAMA_CPP_SCRIPTS_DIR
-    points at a directory containing one, else None."""
+    """Returns (absolute_path, mtime_ns, size) for a local convert_hf_to_gguf.py
+    if UNSLOTH_LLAMA_CPP_SCRIPTS_DIR points at a directory containing one, else None.
+    The mtime/size form part of the lru_cache key so in-place edits invalidate the cache."""
     scripts_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
     if not scripts_dir:
         return None
+    scripts_dir = os.path.abspath(os.path.expanduser(os.path.expandvars(scripts_dir)))
     if not os.path.isdir(scripts_dir):
         logger.warning(
             f"Unsloth: UNSLOTH_LLAMA_CPP_SCRIPTS_DIR='{scripts_dir}' is not a directory; "
@@ -133,8 +136,9 @@ def _resolve_local_convert_script():
         return None
     for name in ("convert_hf_to_gguf.py", "convert-hf-to-gguf.py"):
         candidate = os.path.join(scripts_dir, name)
-        if os.path.exists(candidate):
-            return candidate
+        if os.path.isfile(candidate):
+            stat = os.stat(candidate)
+            return (candidate, stat.st_mtime_ns, stat.st_size)
     logger.warning(
         f"Unsloth: UNSLOTH_LLAMA_CPP_SCRIPTS_DIR='{scripts_dir}' has no convert_hf_to_gguf.py; "
         f"falling back to network download."
@@ -893,22 +897,25 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
 
 
 @lru_cache(2)
-def _download_convert_hf_to_gguf_cached(name, _local_script):
+def _download_convert_hf_to_gguf_cached(name, _local_script_key):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Downloads from llama.cpp's Github report (or reads a local copy if
-    # UNSLOTH_LLAMA_CPP_SCRIPTS_DIR points at one — _local_script is resolved
+    # Downloads from llama.cpp's Github repository (or reads a local copy if
+    # UNSLOTH_LLAMA_CPP_SCRIPTS_DIR points at one — _local_script_key is resolved
     # by the wrapper above before the cache lookup)
+    _local_script = None if _local_script_key is None else _local_script_key[0]
 
     # Ensure llama.cpp directory exists
     os.makedirs(LLAMA_CPP_DEFAULT_DIR, exist_ok=True)
 
     supported_types = set() # Initialize outside try block
+    text_archs = set()
+    vision_archs = set()
     temp_original_file_path = None # Initialize for finally block
 
     try:
         # 1. Obtain the file (local override takes precedence over network)
         if _local_script is not None:
-            print(f"Unsloth: Using local convert_hf_to_gguf.py from {_local_script}")
+            logger.info(f"Unsloth: Using local convert_hf_to_gguf.py from {_local_script}")
             with open(_local_script, "rb") as f:
                 original_content = f.read()
         else:
@@ -992,11 +999,12 @@ def _download_convert_hf_to_gguf_cached(name, _local_script):
              del sys.modules[original_module_name]
 
     except Exception as e:
-         logger.error(f"Unsloth: Error during download or introspection of original script: {e}", exc_info=True)
+         source = f"local file '{_local_script}'" if _local_script is not None else "network download"
+         logger.error(f"Unsloth: Error during {source} or introspection of original script: {e}", exc_info=True)
          if temp_original_file_path and os.path.exists(temp_original_file_path):
              try: os.remove(temp_original_file_path)
              except OSError as remove_error: logger.warning(f"Could not remove temp file {temp_original_file_path}: {remove_error}")
-         raise RuntimeError(f"Failed during download/introspection of original script: {e}") from e
+         raise RuntimeError(f"Failed during {source}/introspection of original script: {e}") from e
     finally:
         if temp_original_file_path and os.path.exists(temp_original_file_path):
             try:
@@ -1067,7 +1075,12 @@ def _download_convert_hf_to_gguf_cached(name, _local_script):
 
 
         # 4. Write Patched File
-        patched_filename = os.path.join(LLAMA_CPP_DEFAULT_DIR, f"{name}.py")
+        if _local_script_key is None:
+            patched_name = name
+        else:
+            digest = hashlib.sha256(repr(_local_script_key).encode("utf-8")).hexdigest()[:12]
+            patched_name = f"{name}_{digest}"
+        patched_filename = os.path.join(LLAMA_CPP_DEFAULT_DIR, f"{patched_name}.py")
         logger.info(f"Unsloth: Saving patched script to {patched_filename}")
         with open(patched_filename, "wb") as file:
             file.write(patched_content)
