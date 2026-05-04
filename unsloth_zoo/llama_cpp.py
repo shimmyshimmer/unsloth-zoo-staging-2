@@ -35,7 +35,6 @@ import requests
 import json
 from tqdm.auto import tqdm as ProgressBar
 from functools import lru_cache
-import hashlib
 import inspect
 import contextlib
 import importlib.util
@@ -147,12 +146,23 @@ def _resolve_local_convert_script():
 
 
 @contextlib.contextmanager
-def use_local_gguf():
-    """Context manager to temporarily use llama.cpp's local gguf-py"""
+def use_local_gguf(llama_cpp_dir = None):
+    """Context manager to temporarily use llama.cpp's local gguf-py.
+    If llama_cpp_dir is None, prefer UNSLOTH_LLAMA_CPP_SCRIPTS_DIR's gguf-py when present
+    (so a pinned llama.cpp checkout's matching gguf-py is picked up), else fall back to
+    LLAMA_CPP_DEFAULT_DIR."""
     # Store original state
     original_sys_path = sys.path.copy()
     original_modules = set(sys.modules.keys())
-    gguf_py_path = os.path.join(LLAMA_CPP_DEFAULT_DIR, "gguf-py")
+    if llama_cpp_dir is None:
+        scripts_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
+        if scripts_dir:
+            scripts_dir = os.path.abspath(os.path.expanduser(os.path.expandvars(scripts_dir)))
+            if os.path.isdir(os.path.join(scripts_dir, "gguf-py")):
+                llama_cpp_dir = scripts_dir
+        if llama_cpp_dir is None:
+            llama_cpp_dir = LLAMA_CPP_DEFAULT_DIR
+    gguf_py_path = os.path.join(llama_cpp_dir, "gguf-py")
 
     original_gguf_modules = {}
 
@@ -562,16 +572,24 @@ def check_llama_cpp(llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR):
         )
     pass
 
-    # Check for converter script
-    for converter in ["convert-hf-to-gguf.py", "convert_hf_to_gguf.py"]:
-        location = os.path.join(llama_cpp_folder, converter)
-        if os.path.exists(location):
-            converter_location = location
-            break
-    pass
+    # Check for converter script. Prefer UNSLOTH_LLAMA_CPP_SCRIPTS_DIR so this matches
+    # _download_convert_hf_to_gguf, which honors the same override.
+    local_convert_script = _resolve_local_convert_script()
+    if local_convert_script is not None:
+        converter_location = local_convert_script[0]
+    else:
+        for converter in ["convert-hf-to-gguf.py", "convert_hf_to_gguf.py"]:
+            location = os.path.join(llama_cpp_folder, converter)
+            if os.path.isfile(location):
+                converter_location = location
+                break
+        pass
 
     if converter_location is None:
-        raise RuntimeError(f"Unsloth: Failed to find converter script in {llama_cpp_folder}")
+        raise RuntimeError(
+            f"Unsloth: Failed to find converter script in {llama_cpp_folder} "
+            f"or UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"
+        )
     pass
 
     return quantizer_location, converter_location
@@ -1004,7 +1022,7 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_key):
          if temp_original_file_path and os.path.exists(temp_original_file_path):
              try: os.remove(temp_original_file_path)
              except OSError as remove_error: logger.warning(f"Could not remove temp file {temp_original_file_path}: {remove_error}")
-         raise RuntimeError(f"Failed during {source}/introspection of original script: {e}") from e
+         raise RuntimeError(f"Failed during {source} (introspection of original script): {e}") from e
     finally:
         if temp_original_file_path and os.path.exists(temp_original_file_path):
             try:
@@ -1075,12 +1093,7 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_key):
 
 
         # 4. Write Patched File
-        if _local_script_key is None:
-            patched_name = name
-        else:
-            digest = hashlib.sha256(repr(_local_script_key).encode("utf-8")).hexdigest()[:12]
-            patched_name = f"{name}_{digest}"
-        patched_filename = os.path.join(LLAMA_CPP_DEFAULT_DIR, f"{patched_name}.py")
+        patched_filename = os.path.join(LLAMA_CPP_DEFAULT_DIR, f"{name}.py")
         logger.info(f"Unsloth: Saving patched script to {patched_filename}")
         with open(patched_filename, "wb") as file:
             file.write(patched_content)
