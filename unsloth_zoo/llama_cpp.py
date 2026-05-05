@@ -33,6 +33,7 @@ import time
 import re
 import requests
 import json
+import hashlib
 from tqdm.auto import tqdm as ProgressBar
 from functools import lru_cache
 import inspect
@@ -1039,7 +1040,7 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_key):
          if temp_original_file_path and os.path.exists(temp_original_file_path):
              try: os.remove(temp_original_file_path)
              except OSError as remove_error: logger.warning(f"Could not remove temp file {temp_original_file_path}: {remove_error}")
-         raise RuntimeError(f"Failed during {source} (introspection of original script): {e}") from e
+         raise RuntimeError(f"Failed during {source} or introspection of original script: {e}") from e
     finally:
         if temp_original_file_path and os.path.exists(temp_original_file_path):
             try:
@@ -1110,10 +1111,16 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_key):
 
 
         # 4. Write Patched File
-        # Network and local cache entries get distinct on-disk filenames so that one
-        # cached entry's metadata cannot end up paired with another entry's content
-        # when both coexist in the lru_cache.
-        patched_basename = name if _local_script_key is None else f"{name}_local"
+        # Each cache entry gets its own on-disk filename so coexisting lru_cache entries
+        # cannot end up with one entry's metadata paired with another entry's content.
+        # The local digest is over the cache key tuple (path, mtime_ns, size), so distinct
+        # local checkouts and in-place edits each get a fresh file; network keeps the
+        # unsuffixed name so convert_to_gguf's default converter_location still resolves.
+        if _local_script_key is None:
+            patched_basename = name
+        else:
+            local_digest = hashlib.sha256(repr(_local_script_key).encode("utf-8")).hexdigest()[:12]
+            patched_basename = f"{name}_local_{local_digest}"
         patched_filename = os.path.join(LLAMA_CPP_DEFAULT_DIR, f"{patched_basename}.py")
         logger.info(f"Unsloth: Saving patched script to {patched_filename}")
         with open(patched_filename, "wb") as file:
