@@ -1110,7 +1110,11 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_key):
 
 
         # 4. Write Patched File
-        patched_filename = os.path.join(LLAMA_CPP_DEFAULT_DIR, f"{name}.py")
+        # Network and local cache entries get distinct on-disk filenames so that one
+        # cached entry's metadata cannot end up paired with another entry's content
+        # when both coexist in the lru_cache.
+        patched_basename = name if _local_script_key is None else f"{name}_local"
+        patched_filename = os.path.join(LLAMA_CPP_DEFAULT_DIR, f"{patched_basename}.py")
         logger.info(f"Unsloth: Saving patched script to {patched_filename}")
         with open(patched_filename, "wb") as file:
             file.write(patched_content)
