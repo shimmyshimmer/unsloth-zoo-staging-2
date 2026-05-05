@@ -154,10 +154,16 @@ def use_local_gguf(llama_cpp_dir = None):
     # Store original state
     original_sys_path = sys.path.copy()
     original_modules = set(sys.modules.keys())
-    if llama_cpp_dir is None:
-        scripts_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
-        if scripts_dir:
-            scripts_dir = os.path.abspath(os.path.expanduser(os.path.expandvars(scripts_dir)))
+    if llama_cpp_dir is not None:
+        llama_cpp_dir = os.path.abspath(os.path.expanduser(os.path.expandvars(llama_cpp_dir)))
+    else:
+        # Only honor UNSLOTH_LLAMA_CPP_SCRIPTS_DIR's gguf-py when the same dir was accepted
+        # as a converter source. A dir with gguf-py/ but no convert_hf_to_gguf.py is rejected
+        # by _resolve_local_convert_script, and using its gguf-py against the network-fallback
+        # converter recreates the version-drift bug this feature is meant to avoid.
+        local_convert_script = _resolve_local_convert_script()
+        if local_convert_script is not None:
+            scripts_dir = os.path.dirname(local_convert_script[0])
             if os.path.isdir(os.path.join(scripts_dir, "gguf-py")):
                 llama_cpp_dir = scripts_dir
             else:
@@ -593,9 +599,11 @@ def check_llama_cpp(llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR):
 
     if converter_location is None:
         env_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
-        env_hint = (
-            f" or UNSLOTH_LLAMA_CPP_SCRIPTS_DIR='{env_dir}'" if env_dir else ""
-        )
+        if env_dir:
+            env_dir = os.path.abspath(os.path.expanduser(os.path.expandvars(env_dir)))
+            env_hint = f" or UNSLOTH_LLAMA_CPP_SCRIPTS_DIR='{env_dir}'"
+        else:
+            env_hint = ""
         raise RuntimeError(
             f"Unsloth: Failed to find converter script in {llama_cpp_folder}{env_hint}"
         )
@@ -1437,11 +1445,13 @@ def convert_to_gguf(
     # Build env for the converter subprocess so a pinned UNSLOTH_LLAMA_CPP_SCRIPTS_DIR
     # also propagates its sibling gguf-py to the child interpreter via PYTHONPATH; without
     # this the converter falls back to the default-install or system gguf and breaks
-    # version-pinned converters.
+    # version-pinned converters. Only inject when the same env dir was accepted as a
+    # converter source, so a partially-configured dir (gguf-py without convert script)
+    # does not poison the network-fallback converter.
     sub_env = os.environ.copy()
-    scripts_dir = sub_env.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
-    if scripts_dir:
-        scripts_dir_abs = os.path.abspath(os.path.expanduser(os.path.expandvars(scripts_dir)))
+    local_convert_script = _resolve_local_convert_script()
+    if local_convert_script is not None:
+        scripts_dir_abs = os.path.dirname(local_convert_script[0])
         gguf_py_dir = os.path.join(scripts_dir_abs, "gguf-py")
         if os.path.isdir(gguf_py_dir):
             existing_pythonpath = sub_env.get("PYTHONPATH", "")
