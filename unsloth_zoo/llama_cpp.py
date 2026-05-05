@@ -131,7 +131,7 @@ def _resolve_local_convert_script():
     if not os.path.isdir(scripts_dir):
         logger.warning(
             f"Unsloth: UNSLOTH_LLAMA_CPP_SCRIPTS_DIR='{scripts_dir}' is not a directory; "
-            f"falling back to network download."
+            f"ignoring the override."
         )
         return None
     for name in ("convert_hf_to_gguf.py", "convert-hf-to-gguf.py"):
@@ -141,7 +141,7 @@ def _resolve_local_convert_script():
             return (candidate, stat.st_mtime_ns, stat.st_size)
     logger.warning(
         f"Unsloth: UNSLOTH_LLAMA_CPP_SCRIPTS_DIR='{scripts_dir}' has no convert_hf_to_gguf.py "
-        f"(or convert-hf-to-gguf.py); falling back to network download."
+        f"(or convert-hf-to-gguf.py); ignoring the override."
     )
     return None
 
