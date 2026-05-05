@@ -592,9 +592,12 @@ def check_llama_cpp(llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR):
         pass
 
     if converter_location is None:
+        env_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
+        env_hint = (
+            f" or UNSLOTH_LLAMA_CPP_SCRIPTS_DIR='{env_dir}'" if env_dir else ""
+        )
         raise RuntimeError(
-            f"Unsloth: Failed to find converter script in {llama_cpp_folder} "
-            f"or UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"
+            f"Unsloth: Failed to find converter script in {llama_cpp_folder}{env_hint}"
         )
     pass
 
@@ -1445,6 +1448,16 @@ def convert_to_gguf(
             sub_env["PYTHONPATH"] = (
                 gguf_py_dir + os.pathsep + existing_pythonpath
                 if existing_pythonpath else gguf_py_dir
+            )
+            # Suppress the converter's own Path(__file__).parent / "gguf-py" insertion
+            # so the pinned PYTHONPATH wins instead of LLAMA_CPP_DEFAULT_DIR/gguf-py.
+            sub_env["NO_LOCAL_GGUF"] = "1"
+        else:
+            logger.warning(
+                f"Unsloth: UNSLOTH_LLAMA_CPP_SCRIPTS_DIR='{scripts_dir_abs}' has no gguf-py/ "
+                f"subdirectory; the converter subprocess will use the default gguf "
+                f"installation, which may cause version mismatches with a pinned "
+                f"convert_hf_to_gguf.py."
             )
 
     # Execute conversions
