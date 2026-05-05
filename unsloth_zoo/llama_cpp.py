@@ -139,8 +139,8 @@ def _resolve_local_convert_script():
             stat = os.stat(candidate)
             return (candidate, stat.st_mtime_ns, stat.st_size)
     logger.warning(
-        f"Unsloth: UNSLOTH_LLAMA_CPP_SCRIPTS_DIR='{scripts_dir}' has no convert_hf_to_gguf.py; "
-        f"falling back to network download."
+        f"Unsloth: UNSLOTH_LLAMA_CPP_SCRIPTS_DIR='{scripts_dir}' has no convert_hf_to_gguf.py "
+        f"(or convert-hf-to-gguf.py); falling back to network download."
     )
     return None
 
@@ -160,6 +160,12 @@ def use_local_gguf(llama_cpp_dir = None):
             scripts_dir = os.path.abspath(os.path.expanduser(os.path.expandvars(scripts_dir)))
             if os.path.isdir(os.path.join(scripts_dir, "gguf-py")):
                 llama_cpp_dir = scripts_dir
+            else:
+                logger.warning(
+                    f"Unsloth: UNSLOTH_LLAMA_CPP_SCRIPTS_DIR='{scripts_dir}' has no gguf-py/ "
+                    f"subdirectory; gguf-py will be loaded from {LLAMA_CPP_DEFAULT_DIR}, "
+                    f"which may cause version mismatches with a pinned convert_hf_to_gguf.py."
+                )
         if llama_cpp_dir is None:
             llama_cpp_dir = LLAMA_CPP_DEFAULT_DIR
     gguf_py_path = os.path.join(llama_cpp_dir, "gguf-py")
@@ -578,7 +584,7 @@ def check_llama_cpp(llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR):
     if local_convert_script is not None:
         converter_location = local_convert_script[0]
     else:
-        for converter in ["convert-hf-to-gguf.py", "convert_hf_to_gguf.py"]:
+        for converter in ["convert_hf_to_gguf.py", "convert-hf-to-gguf.py"]:
             location = os.path.join(llama_cpp_folder, converter)
             if os.path.isfile(location):
                 converter_location = location
@@ -914,7 +920,7 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
     return _download_convert_hf_to_gguf_cached(name, _resolve_local_convert_script())
 
 
-@lru_cache(2)
+@lru_cache(maxsize=8)
 def _download_convert_hf_to_gguf_cached(name, _local_script_key):
     # All Unsloth Zoo code licensed under LGPLv3
     # Downloads from llama.cpp's Github repository (or reads a local copy if
@@ -1425,6 +1431,22 @@ def convert_to_gguf(
             }
         runs_to_do.append((args, final_output, "model"))
 
+    # Build env for the converter subprocess so a pinned UNSLOTH_LLAMA_CPP_SCRIPTS_DIR
+    # also propagates its sibling gguf-py to the child interpreter via PYTHONPATH; without
+    # this the converter falls back to the default-install or system gguf and breaks
+    # version-pinned converters.
+    sub_env = os.environ.copy()
+    scripts_dir = sub_env.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
+    if scripts_dir:
+        scripts_dir_abs = os.path.abspath(os.path.expanduser(os.path.expandvars(scripts_dir)))
+        gguf_py_dir = os.path.join(scripts_dir_abs, "gguf-py")
+        if os.path.isdir(gguf_py_dir):
+            existing_pythonpath = sub_env.get("PYTHONPATH", "")
+            sub_env["PYTHONPATH"] = (
+                gguf_py_dir + os.pathsep + existing_pythonpath
+                if existing_pythonpath else gguf_py_dir
+            )
+
     # Execute conversions
     for args, output_file, description in runs_to_do:
         if print_output: print(f"\nUnsloth: Converting {description}...")
@@ -1440,10 +1462,12 @@ def convert_to_gguf(
         try:
             if print_output:
                 result = subprocess.run(command, shell=False, check=True, text=True,
-                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                      env=sub_env)
                 print(result.stdout)
             else:
-                subprocess.run(command, shell=False, check=True, capture_output=True)
+                subprocess.run(command, shell=False, check=True, capture_output=True,
+                               env=sub_env)
         except subprocess.CalledProcessError as e:
             if print_output and hasattr(e, 'stdout') and e.stdout:
                 print(e.stdout)
