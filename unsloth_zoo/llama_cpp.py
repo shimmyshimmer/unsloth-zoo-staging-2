@@ -8,11 +8,11 @@
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 # GNU General Public License for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 __all__ = [
     "convert_to_gguf",
@@ -122,8 +122,8 @@ LLAMA_CPP_DEFAULT_DIR = os.environ.get(
 
 def _resolve_local_convert_script():
     """Returns (absolute_path, mtime_ns, size) for a local convert_hf_to_gguf.py
-    if UNSLOTH_LLAMA_CPP_SCRIPTS_DIR points at a directory containing one, else None.
-    The mtime/size form part of the lru_cache key so in-place edits invalidate the cache."""
+ if UNSLOTH_LLAMA_CPP_SCRIPTS_DIR points at a directory containing one, else None.
+ The mtime/size form part of the lru_cache key so in-place edits invalidate the cache."""
     scripts_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
     if not scripts_dir:
         return None
@@ -149,9 +149,9 @@ def _resolve_local_convert_script():
 @contextlib.contextmanager
 def use_local_gguf(llama_cpp_dir = None):
     """Context manager to temporarily use llama.cpp's local gguf-py.
-    If llama_cpp_dir is None, prefer UNSLOTH_LLAMA_CPP_SCRIPTS_DIR's gguf-py when present
-    (so a pinned llama.cpp checkout's matching gguf-py is picked up), else fall back to
-    LLAMA_CPP_DEFAULT_DIR."""
+ If llama_cpp_dir is None, prefer UNSLOTH_LLAMA_CPP_SCRIPTS_DIR's gguf-py when present
+ (so a pinned llama.cpp checkout's matching gguf-py is picked up), else fall back to
+ LLAMA_CPP_DEFAULT_DIR."""
     # Store original state
     original_sys_path = sys.path.copy()
     original_modules = set(sys.modules.keys())
@@ -481,7 +481,7 @@ pass
 
 def _find_visual_studio():
     """Detect Visual Studio Build Tools installation (aligned with setup.ps1 Find-VsBuildTools).
-    Returns (cmake_generator, vs_install_path) or (None, None) if not found."""
+ Returns (cmake_generator, vs_install_path) or (None, None) if not found."""
     program_files = [
         os.environ.get('ProgramFiles', r'C:\Program Files'),
         os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
@@ -500,7 +500,7 @@ def _find_visual_studio():
 
 def _find_openssl_root():
     """Find OpenSSL dev installation on Windows (aligned with setup.ps1 $OpenSslRoots).
-    Returns the root path if found, or None."""
+ Returns the root path if found, or None."""
     openssl_roots = [
         r'C:\Program Files\OpenSSL-Win64',
         r'C:\Program Files\OpenSSL',
@@ -514,7 +514,7 @@ def _find_openssl_root():
 
 def _find_lib_path(lib_name):
     """Find a shared library path using gcc's linker search.
-    Returns the absolute path if found, or None."""
+ Returns the absolute path if found, or None."""
     try:
         result = subprocess.run(
             ['gcc', f'-print-file-name={lib_name}'],
@@ -1094,7 +1094,7 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_key):
             num_experts_pattern = rb'n_experts = self\.hparams\[(["\'])num_experts\1\]'
             replacement = (
                 b"# Qwen3MoE seems to use num_local_experts instead of num_experts\n"
-                b"            n_experts = self.hparams.get('num_experts', None) or self.hparams.get('num_local_experts')"
+                b" n_experts = self.hparams.get('num_experts', None) or self.hparams.get('num_local_experts')"
             )
 
             new_patched_content = re.sub(num_experts_pattern, replacement, patched_content)
@@ -1934,8 +1934,8 @@ def add_llama_cpp_system_message(messages, tools, inplace = False):
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 # GNU General Public License for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+# along with this program. If not, see <https://www.gnu.org/licenses/>.

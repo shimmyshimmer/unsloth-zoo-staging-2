@@ -1,0 +1,21 @@
+{
+  "modelConfigs": {
+    "customAliases": {
+      "review": {
+        "modelConfig": {
+          "generateContentConfig": {
+            "thinkingConfig": {
+              "thinkingLevel": "HIGH"
+            }
+          }
+        }
+      }
+    }
+  },
+  "context": {
+    "fileName": [
+      "GEMINI.review.md",
+      "GEMINI.md"
+    ]
+  }
+}
