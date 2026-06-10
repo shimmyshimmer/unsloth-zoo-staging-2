@@ -124,7 +124,9 @@ def test_gated_delta_kernel_grad_raises_without_patch():
             q_, k_, v_, a, b, A_log, dt_bias,
             state=None, mask=None, use_kernel=True,
         )
-        y = out[0] if isinstance(out, tuple) else out
+        # The raw Metal kernel path returns a list of outputs; ops paths
+        # return a tuple or a bare array.
+        y = out[0] if isinstance(out, (tuple, list)) else out
         return y.astype(mx.float32).sum()
 
     with pytest.raises(ValueError) as exc:
