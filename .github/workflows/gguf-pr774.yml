@@ -1,0 +1,33 @@
+name: gguf-pr774
+on:
+  push:
+    branches: ["gguf-pr774-validate"]
+  workflow_dispatch:
+concurrency:
+  group: gguf-pr774-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  gguf:
+    name: PR 774 GGUF block_count on Apple Silicon
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - name: Install zoo + GGUF converter tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .
+          pip install "transformers>=4.57.0" gguf safetensors huggingface_hub sentencepiece protobuf numpy
+      - name: PR774 GGUF block_count (merged-save Qwen3.5)
+        env:
+          MAC774_WORK: ${{ runner.temp }}/mac774_work
+        run: python mac774_test.py
