@@ -38,5 +38,9 @@ jobs:
           assert "self.mlp(mlp_norm_out)" in src, "non-fp16 path missing"
           print("PR787 compile imports on real mlx and fp16 guard is present")
           PY
-      - name: Source-guard test + metal e2e regression
-        run: python -m pytest tests/test_mlx_trainer_internals.py tests/test_mlx_training_e2e_metal.py -v -rs
+      # The source-inspection guard lives in test_mlx_trainer_internals, which uses
+      # the torch simulation shim; it is validated on the Linux harness. The probe
+      # above already asserts the same guard against the real-mlx compile module.
+      # Here we run only the real-Metal e2e regression.
+      - name: Metal e2e regression (real Apple Silicon)
+        run: python -m pytest tests/test_mlx_training_e2e_metal.py -v -rs
