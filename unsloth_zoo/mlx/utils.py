@@ -4465,6 +4465,7 @@ class FiniteTextBatchPlan:
         "_visit_policy",
         "_visit_seed",
         "_visit_epoch_cache",
+        "_cycle_length",
     )
 
     _VISIT_POLICIES = ("identity", "epoch_permute")
@@ -4482,6 +4483,7 @@ class FiniteTextBatchPlan:
         label_dtype=np.int64,
         visit_policy="identity",
         visit_seed=None,
+        cycle_length=None,
     ):
         self._rows = tuple(rows)
         self._schedule = tuple(tuple(batch) for batch in schedule)
@@ -4500,6 +4502,13 @@ class FiniteTextBatchPlan:
             else _normalize_seed(visit_seed)
         )
         self._visit_epoch_cache = None
+        # Micro-batches in ONE dataset pass, which len(schedule) is not once a
+        # num_batches horizon cycles the plan. Batching drops sub-two-token rows
+        # and can expand one source item into several, so only the plan itself
+        # knows this count; callback epoch accounting reads it.
+        self._cycle_length = (
+            None if cycle_length is None else max(1, int(cycle_length))
+        )
         if self.max_seq_length < 1:
             raise ValueError("max_seq_length must be positive")
         if self.minimum_width < 0:
@@ -4528,6 +4537,11 @@ class FiniteTextBatchPlan:
 
     def __len__(self):
         return len(self._schedule)
+
+    @property
+    def cycle_length(self):
+        """Micro-batches in one dataset pass (<= len(self))."""
+        return self._cycle_length
 
     @property
     def visit_policy(self):
@@ -4740,9 +4754,9 @@ def _shuffled_full_batch_schedule(
         for group_index in rng.permutation(len(groups)):
             schedule.append(groups[int(group_index)])
             if num_batches is not None and len(schedule) >= num_batches:
-                return tuple(schedule)
+                return tuple(schedule), len(groups)
         if num_batches is None:
-            return tuple(schedule)
+            return tuple(schedule), len(groups)
 
 
 def _create_tokenized_text_plan(tokenized, batch_size, max_seq_length,
@@ -4752,15 +4766,17 @@ def _create_tokenized_text_plan(tokenized, batch_size, max_seq_length,
         row for row in tokenized
         if _labeled_row_has_supervision(row[1], max_seq_length)
     ]
+    schedule, cycle_length = _shuffled_full_batch_schedule(
+        len(tokenized),
+        batch_size,
+        sort_key=lambda index: len(tokenized[index][0]),
+        num_batches=num_batches,
+        seed=seed,
+    )
     return FiniteTextBatchPlan(
         _finite_text_rows(tokenized),
-        _shuffled_full_batch_schedule(
-            len(tokenized),
-            batch_size,
-            sort_key=lambda index: len(tokenized[index][0]),
-            num_batches=num_batches,
-            seed=seed,
-        ),
+        schedule,
+        cycle_length=cycle_length,
         max_seq_length=max_seq_length,
         pad_id=pad_id,
         # One reusable shuffled cycle: eligible for epoch-permuted visits.
@@ -6388,7 +6404,7 @@ def _create_default_text_plan(
     seed=42,
 ):
     """Build the CPU equivalent of mlx-lm's finite text batch schedule."""
-    schedule = _shuffled_full_batch_schedule(
+    schedule, cycle_length = _shuffled_full_batch_schedule(
         len(dataset),
         batch_size,
         sort_key=dataset.itemlen,
@@ -6402,6 +6418,7 @@ def _create_default_text_plan(
     return FiniteTextBatchPlan(
         rows,
         schedule,
+        cycle_length=cycle_length,
         max_seq_length=max_seq_length,
         pad_id=0,
         # Match mlx-lm iterate_batches padding (1 + 32*ceil(len/32)) so the
@@ -6745,6 +6762,19 @@ def _create_distributed_text_plan(
     rng = np.random.RandomState(_normalize_seed(seed))
 
     schedule = []
+    # Micro-batches in ONE dataset pass. Every permutation visits all global
+    # batches and a local slice is non-empty regardless of visit order, so this
+    # holds for every pass even if num_batches truncates the first one.
+    cycle_length = sum(
+        1 for group in batch_idx
+        if _rank_slice_distributed_batch(
+            group,
+            batch_size,
+            comm_group=comm_group,
+            pad_source=idx,
+            pad_mode=distributed_pad_mode,
+        )
+    )
     while True:
         indices = rng.permutation(len(batch_idx))
         for i in indices:
@@ -6773,6 +6803,7 @@ def _create_distributed_text_plan(
     return FiniteTextBatchPlan(
         rows,
         schedule,
+        cycle_length=cycle_length,
         max_seq_length=max_seq_length,
         pad_id=0 if pad_id is None else int(pad_id),
         minimum_width=2,
@@ -6946,6 +6977,18 @@ def _create_ordered_text_plan(
     order_pos = 0
     seen = 0
     global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
+    # Micro-batches in ONE dataset pass. Every epoch chunks an order of the
+    # same length and a chunk's local slice is non-empty whatever rows it holds,
+    # so this is constant across epochs even under num_batches truncation.
+    cycle_length = sum(
+        1 for start in range(0, len(order), global_batch_size)
+        if _rank_slice_distributed_batch(
+            order[start : start + global_batch_size],
+            batch_size,
+            comm_group=comm_group,
+            pad_source=order,
+        )
+    )
     target_items = (
         len(tokenized) * (1 if num_epochs is None else int(num_epochs))
         if num_batches is None else None
@@ -6996,6 +7039,7 @@ def _create_ordered_text_plan(
     return FiniteTextBatchPlan(
         rows,
         schedule,
+        cycle_length=cycle_length,
         max_seq_length=max_seq_length,
         pad_id=0 if pad_id is None else int(pad_id),
         minimum_width=2,

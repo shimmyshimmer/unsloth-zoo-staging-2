@@ -36,9 +36,10 @@ Usage mirrors TRL notebooks:
     trainer.train()
 """
 
-from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass, replace
+from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass, replace
 import concurrent.futures
 import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -113,6 +114,175 @@ class MLXTrainOutput(dict):
     @property
     def training_loss(self):
         return self.get("train_loss", 0.0)
+
+
+@dataclass
+class _MLXTrainerControl:
+    """Torch-free subset of Hugging Face TrainerControl used by callbacks."""
+
+    should_training_stop: bool = False
+    should_epoch_stop: bool = False
+    should_save: bool = False
+    should_evaluate: bool = False
+    should_log: bool = False
+
+
+@dataclass
+class _MLXTrainerState:
+    """Torch-free subset of Hugging Face TrainerState used by callbacks."""
+
+    epoch: float | None = None
+    global_step: int = 0
+    max_steps: int = 0
+    logging_steps: int = 500
+    eval_steps: int = 500
+    save_steps: int = 500
+    train_batch_size: int | None = None
+    num_train_epochs: int = 0
+    num_input_tokens_seen: int = 0
+    total_flos: float = 0
+    log_history: list = field(default_factory=list)
+    best_metric: float | None = None
+    best_global_step: int | None = None
+    best_model_checkpoint: str | None = None
+    is_local_process_zero: bool = True
+    is_world_process_zero: bool = True
+    is_hyper_param_search: bool = False
+    trial_name: str | None = None
+    trial_params: dict | None = None
+    stateful_callbacks: dict = field(default_factory=dict)
+
+
+# Probed once from the installed DefaultFlowCallback; None until first asked.
+_DEFAULT_FLOW_FINAL_STEP_EVAL = None
+
+
+def _default_flow_evaluates_final_step():
+    """Whether the installed DefaultFlowCallback forces a final-step evaluation.
+
+    transformers 5.x evaluates again at ``state.global_step >= state.max_steps``
+    when the step interval did not already land there; 4.x has no such block.
+    Ask the shipped callback rather than pinning a version, so the loop's own
+    cadence tracks whichever transformers is installed and a with-flow run and a
+    without-flow run always agree.
+
+    Probed by running the real callback: it reads plain attributes, so the
+    torch-free _MLXTrainerState/_MLXTrainerControl stand in for HF's own and the
+    probe adds no import to the module. No transformers -- or a future one that
+    reads an argument this stand-in lacks -- keeps the 4.x answer, which is what
+    the loop did before this cadence existed.
+    """
+    global _DEFAULT_FLOW_FINAL_STEP_EVAL
+    if _DEFAULT_FLOW_FINAL_STEP_EVAL is None:
+        _DEFAULT_FLOW_FINAL_STEP_EVAL = False
+        try:
+            from transformers.trainer_callback import DefaultFlowCallback
+
+            class _FlowProbeArgs:
+                eval_strategy = "steps"
+                eval_delay = 0
+                logging_strategy = "no"
+                logging_first_step = False
+                save_strategy = "no"
+
+            # 6 % 4 != 0, so only the final-step block can raise the request.
+            control = _MLXTrainerControl()
+            DefaultFlowCallback().on_step_end(
+                _FlowProbeArgs(),
+                _MLXTrainerState(
+                    global_step=6, max_steps=6,
+                    logging_steps=4, eval_steps=4, save_steps=4,
+                ),
+                control,
+            )
+            _DEFAULT_FLOW_FINAL_STEP_EVAL = bool(control.should_evaluate)
+        except Exception:
+            pass
+    return _DEFAULT_FLOW_FINAL_STEP_EVAL
+
+
+def _resolve_interval_steps(value, total_steps):
+    """Resolve an HF-style step interval to an absolute number of steps.
+
+    HF accepts logging_steps / eval_steps / save_steps as a step count or a
+    ratio in (0, 1) of the total steps, expanded in TrainerState.compute_steps.
+    int(ratio) would turn 0.1 into 0, silently disabling the interval and
+    making HF's DefaultFlowCallback divide by zero.
+    """
+    try:
+        value = float(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    if value <= 0:
+        return 0
+    if value < 1:
+        # max(1, ...) only guards total_steps == 0; ceil is already >= 1 otherwise.
+        return max(1, math.ceil(float(total_steps) * value))
+    return int(value)
+
+
+class _MLXCallbackHandler:
+    """Small HF-compatible callback dispatcher that keeps MLX imports Torch-free."""
+
+    def __init__(self, callbacks, model, processing_class, optimizer, lr_scheduler):
+        self.callbacks = []
+        for callback in callbacks:
+            self.add_callback(callback)
+        self.model = model
+        self.processing_class = processing_class
+        self.optimizer = optimizer
+        self.lr_scheduler = lr_scheduler
+        self.train_dataloader = None
+        self.eval_dataloader = None
+
+    @property
+    def callback_list(self):
+        """Return callback class names for diagnostics."""
+        return "\n".join(cb.__class__.__name__ for cb in self.callbacks)
+
+    def add_callback(self, callback):
+        """Add a callback class or instance."""
+        self.callbacks.append(callback() if isinstance(callback, type) else callback)
+
+    def pop_callback(self, callback):
+        """Remove and return a callback class or instance."""
+        if isinstance(callback, type):
+            for cb in self.callbacks:
+                if isinstance(cb, callback):
+                    self.callbacks.remove(cb)
+                    return cb
+        else:
+            for cb in self.callbacks:
+                if cb == callback:
+                    self.callbacks.remove(cb)
+                    return cb
+        return None
+
+    def remove_callback(self, callback):
+        """Remove a callback class or instance."""
+        self.pop_callback(callback)
+
+    def call_event(self, event, args, state, control, **kwargs):
+        """Dispatch one callback event and return the latest control object."""
+        for callback in self.callbacks:
+            method = getattr(callback, event, None)
+            if method is None:
+                continue
+            result = method(
+                args,
+                state,
+                control,
+                model=self.model,
+                processing_class=self.processing_class,
+                optimizer=self.optimizer,
+                lr_scheduler=self.lr_scheduler,
+                train_dataloader=self.train_dataloader,
+                eval_dataloader=self.eval_dataloader,
+                **kwargs,
+            )
+            if result is not None:
+                control = result
+        return control
 
 
 class _MLXTokenizedDatasetView:
@@ -751,6 +921,65 @@ def _prune_stale_checkpoints(output_dir, save_total_limit):
               f"(save_total_limit={save_total_limit})")
 
 
+def _mlx_batch_input_token_count(batch_data, mode="all", pad_token_id=None):
+    """Input-token positions in a training microbatch (HF num_input_tokens_seen).
+
+    HF's TrainerState.num_input_tokens_seen counts the main input tensor's numel
+    (every forwarded position: prompt + response + padding), NOT just the
+    supervised/label tokens the loss mask counts. Mirror that here so a callback
+    reading state.num_input_tokens_seen for token-budget stopping or throughput
+    reporting is not undercounted by the masked/prompt fraction (which for
+    completion-only / assistant-only loss is most of the sequence).
+
+    ``mode`` is HF's normalized include_num_input_tokens_seen value. "all" (and
+    the un-normalized True a non-TrainingArguments config keeps) counts every
+    forwarded position as above. "non_padding" follows HF's ladder instead --
+    identical in transformers 4.57.x (the inline block in _inner_training_loop)
+    and 5.x (Trainer._track_num_input_tokens): the attention mask when the batch
+    carries one, else a pad-token comparison when the processing class exposes a
+    pad_token_id, else every position. The text/preference/GRPO tuple batch has
+    no attention_mask, but its ``lengths`` column 1 is the exclusive end of the
+    real tokens (the same column the loss masks compare against, and what
+    mlx-lm's iterate_batches emits), and rows are written at ``[0, length)``, so
+    summing it is exactly that batch's attention-mask sum. DDP pad rows carry
+    length 0 and therefore drop out, as they should.
+
+    Uses ``.shape`` (a tuple under both real mlx and the torch test shim) rather
+    than a backend-specific ``.size`` / ``.numel``. Handles the text/preference/
+    GRPO tuple batch (input ids first) and the VLM dict batch (``input_ids`` key);
+    returns 0 when no input-id tensor is present so the counter simply does not
+    advance rather than raising.
+    """
+    import math
+    attention_mask = None
+    lengths = None
+    if isinstance(batch_data, dict):
+        arr = batch_data.get("input_ids")
+        attention_mask = batch_data.get("attention_mask")
+    elif isinstance(batch_data, (tuple, list)) and batch_data:
+        arr = batch_data[0]
+        lengths = batch_data[1] if len(batch_data) > 1 else None
+    else:
+        arr = None
+    if arr is None or not hasattr(arr, "shape"):
+        return 0
+    if mode != "non_padding":
+        return int(math.prod(arr.shape))
+    if attention_mask is not None and hasattr(attention_mask, "shape"):
+        return int(attention_mask.sum().item())
+    if (
+        lengths is not None
+        and hasattr(lengths, "shape")
+        and len(lengths.shape) == 2
+        and lengths.shape[1] == 2
+    ):
+        return int(lengths[:, 1].sum().item())
+    if pad_token_id is not None:
+        return int((arr != pad_token_id).sum().item())
+    # HF's last rung: no mask and no pad id, so every position is counted.
+    return int(math.prod(arr.shape))
+
+
 # Fields added after the original public MLXTrainingConfig surface. Keep them a
 # suffix of the declaration order (append new ones at the end and list them
 # here) so positional copies from older configs keep mapping correctly.
@@ -758,6 +987,8 @@ _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "max_eval_batches",
     "streaming_text_length_window_batches",
     "streaming_prefetch_batches",
+    "logging_dir",
+    "run_name",
 )
 
 
@@ -856,7 +1087,8 @@ class MLXTrainingConfig:
     label_smoothing_factor: float = 0.0  # HF LabelSmoother epsilon (text models only)
 
     # Opt-in true global grad-norm reporting when global-norm clipping is off.
-    # Declared LAST so every pre-existing field keeps its positional index.
+    # Appended after every field that predates it, so each keeps its positional
+    # index; the fields below were appended the same way later.
     # When global-norm clipping is the RESOLVED clip mode, the pre-clip norm
     # is computed for clipping anyway and is always reported, so this flag has
     # no effect there. Enabling it adds one cross-tree fp32 reduction per
@@ -869,7 +1101,7 @@ class MLXTrainingConfig:
     # DDP reduction; before clipping, decay, the update and the scoped-LR rescale.
     report_grad_norm: bool = False
 
-    # Lazy-streaming fields, appended LAST after every pre-existing field so
+    # Lazy-streaming fields, appended after every pre-existing field so
     # positional copies from older configs keep mapping correctly. Listed in
     # _MLX_CONFIG_OPTIONAL_COPY_FIELDS.
     max_eval_batches: int | None = None  # Bound an explicitly infinite lazy text eval stream
@@ -881,6 +1113,14 @@ class MLXTrainingConfig:
     # (0 = synchronous default; single-process, host-valued rows only). Queued
     # batches add to the window bound.
     streaming_prefetch_batches: int = 0
+
+    # Callback-visible run metadata (HF TrainingArguments parity). Declared LAST
+    # for the same reason as the fields above: the initializer binds positional
+    # args by field order, so inserting them mid-list would shift the positional
+    # slot of every field after it. Also listed in
+    # _MLX_CONFIG_OPTIONAL_COPY_FIELDS so they stay an exact suffix of it.
+    logging_dir: str | None = None
+    run_name: str | None = None
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
@@ -941,6 +1181,44 @@ class MLXTrainingConfig:
         if self.compile_max_variants is not None:
             resolve_compile_max_variants(self.compile_max_variants)
 
+    def to_dict(self):
+        """Return a TrainingArguments-style dict for integration callbacks."""
+        output = {}
+        for key, value in vars(self).items():
+            if is_dataclass(value):
+                value = asdict(value)
+            elif hasattr(value, "to_dict"):
+                value = value.to_dict()
+            output[key] = value
+        return output
+
+    def to_json_string(self):
+        """Serialize this config like TrainingArguments.to_json_string()."""
+        return json.dumps(self.to_dict(), indent=2, default=str)
+
+    def to_sanitized_dict(self):
+        """Serialize this config like TrainingArguments.to_sanitized_dict().
+
+        The other integration callbacks read the config through to_dict() /
+        to_json_string(); HF's NeptuneCallback reads it through this method
+        instead, unguarded, so omitting it aborts on_train_begin. HF reports
+        the resolved batch sizes next to the raw fields and stringifies
+        anything a tracker cannot store, so mirror both. torch.Tensor is on
+        HF's allow-list but cannot occur here: this module stays Torch-free.
+        """
+        output = self.to_dict()
+        output["train_batch_size"] = self.per_device_train_batch_size
+        output["eval_batch_size"] = (
+            getattr(self, "per_device_eval_batch_size", None)
+            or self.per_device_train_batch_size
+        )
+        # HF compares the exact type, so bool stays bool instead of widening.
+        valid_types = (bool, int, float, str)
+        return {
+            key: value if type(value) in valid_types else str(value)
+            for key, value in output.items()
+        }
+
 
 def _shape_guard_report(
     action,
@@ -967,6 +1245,95 @@ def _shape_guard_report(
     )
 
 
+def _mlx_epoch_microbatches(args, batches, *, includes_epochs=False):
+    """Micro-batches in one epoch when epoch boundaries drive the schedule.
+
+    None for streaming, for runs with no declared epoch count, and for max_steps
+    runs whose batch source cannot report an exact one-pass length: those keep
+    the flat accumulation model. Mirrors the epoch branches of
+    MLXTrainer._callback_batches_per_epoch so the budget, the forced boundary
+    update and the callback epoch events all land on the same micro-batch.
+
+    num_train_epochs is a float in TrainingArguments/SFTConfig, so the declared
+    count is read as one: truncating it sent 0 < num_train_epochs < 1 down the
+    no-epoch flat path, which budgets a whole pass. Only the prebuilt-epochs
+    split needs a whole number, and that branch keeps its integer guard.
+    """
+    if batches is None:
+        return None
+    total = len(batches)
+    if total <= 0:
+        return None
+    if int(getattr(args, "max_steps", 0) or 0) > 0:
+        # HF's forced epoch-final update is not conditional on max_steps:
+        # do_sync_step reads len(dataloader), so max_steps decides when the run
+        # ends, never how an epoch's ragged tail is applied. Returning None here
+        # left that tail pending across on_epoch_end and folded it into the next
+        # epoch. Only the plan's exact one-pass count qualifies: the dataset-size
+        # approximation cannot see what batching retained, so forcing updates on
+        # it would move optimizer steps onto micro-batches that are not boundaries.
+        plan_cycle = getattr(batches, "cycle_length", None)
+        return max(1, int(plan_cycle)) if plan_cycle else None
+    epochs = float(getattr(args, "num_train_epochs", 0) or 0)
+    if epochs <= 0:
+        return None
+    whole_epochs = int(epochs)
+    if includes_epochs and whole_epochs > 0 and total % whole_epochs == 0:
+        return max(1, total // whole_epochs)
+    return total
+
+
+def _mlx_steps_per_epoch(epoch_microbatches, grad_accum):
+    """Optimizer steps one epoch costs when its last micro-batch forces a step."""
+    return max(1, math.ceil(
+        int(epoch_microbatches) / max(1, int(grad_accum))
+    ))
+
+
+def _mlx_microstep_for_step(global_step, epoch_microbatches, grad_accum):
+    """Micro-batches consumed once ``global_step`` optimizer steps have run.
+
+    Epochs close on a forced step, so the mapping is per-epoch rather than flat
+    (HF: epochs_trained * steps_in_epoch + global_step % updates_per_epoch *
+    grad_accum). Equals global_step * grad_accum for a divisible epoch.
+    """
+    epoch_microbatches = int(epoch_microbatches)
+    grad_accum = max(1, int(grad_accum))
+    per_epoch = _mlx_steps_per_epoch(epoch_microbatches, grad_accum)
+    epochs_done, steps_into_epoch = divmod(int(global_step), per_epoch)
+    return epochs_done * epoch_microbatches + min(
+        steps_into_epoch * grad_accum, epoch_microbatches,
+    )
+
+
+def _mlx_microstep_phase(
+    compile_scope, grad_accum, index, epoch_microbatches=None,
+):
+    """Compiled-argument phase at one micro-batch, epoch flush included.
+
+    Accumulation windows restart at every epoch boundary and the epoch's last
+    micro-batch forces the update, so both the window position and the update
+    flag are per-epoch once ``epoch_microbatches`` is known.
+    """
+    if not epoch_microbatches:
+        return phase_for_microstep(compile_scope, grad_accum, index)
+    epoch_microbatches = int(epoch_microbatches)
+    position = int(index) % epoch_microbatches
+    phase = phase_for_microstep(compile_scope, grad_accum, position)
+    if (
+        compile_scope != FULL_STEP_SCOPE
+        or position != epoch_microbatches - 1
+    ):
+        return phase
+    # Epoch-final micro-batch: it traces the updating signature even when it is
+    # not the accumulation window's last position.
+    if phase == "none_no_update":
+        return "single"
+    if phase == "tree_no_update":
+        return "tree_update"
+    return phase
+
+
 def _plan_single_process_text_shapes(
     batches,
     batch_iter,
@@ -977,6 +1344,7 @@ def _plan_single_process_text_shapes(
     distributed_world_size,
     compile_policy,
     install_plan=True,
+    includes_epochs=False,
 ):
     """Plan finite text shapes before optimizer or compiled-callable setup."""
 
@@ -1011,7 +1379,22 @@ def _plan_single_process_text_shapes(
             )
         return None, report, False, None
 
-    total_microsteps = total_steps * args.gradient_accumulation_steps
+    grad_accum = args.gradient_accumulation_steps
+    epoch_microbatches = _mlx_epoch_microbatches(
+        args, batches, includes_epochs=includes_epochs,
+    )
+    if epoch_microbatches:
+        # Epoch-count runs visit whole epochs and each epoch's last micro-batch
+        # forces the update, so the stream is shorter than total_steps * accum.
+        # A fractional num_train_epochs stops part-way through the final epoch,
+        # and those micro-batches are still fetched, so the catalog counts them
+        # via the same step -> micro-batch mapping the runtime fetch uses.
+        # Whole epoch counts land on an epoch boundary and are unchanged.
+        total_microsteps = _mlx_microstep_for_step(
+            total_steps, epoch_microbatches, grad_accum,
+        )
+    else:
+        total_microsteps = total_steps * grad_accum
     event_counts = {}
     for microstep in range(total_microsteps):
         # Same visit mapping as the runtime fetch, so the enumerated catalog
@@ -1020,10 +1403,11 @@ def _plan_single_process_text_shapes(
         batch_index = batches.batch_index_for_visit(microstep)
         family = batches.batch_family(batch_index)
         width = batches.batch_width(batch_index)
-        phase = phase_for_microstep(
+        phase = _mlx_microstep_phase(
             compile_scope,
-            args.gradient_accumulation_steps,
+            grad_accum,
             microstep,
+            epoch_microbatches,
         )
         key = (family, width, phase, len(batches.schedule[batch_index]))
         event_counts[key] = event_counts.get(key, 0) + 1
@@ -1071,10 +1455,31 @@ def _resolve_training_steps(args, batches, batch_iter, *, includes_epochs=False)
         return args.max_steps
     if batches is not None:
         n_batches = len(batches)
-        if includes_epochs:
-            total_steps = n_batches // grad_accum
-        elif args.num_train_epochs > 0:
-            total_steps = (n_batches * args.num_train_epochs) // grad_accum
+        epoch_microbatches = _mlx_epoch_microbatches(
+            args, batches, includes_epochs=includes_epochs,
+        )
+        if epoch_microbatches:
+            # Each epoch's last micro-batch forces an optimizer step (HF's
+            # do_sync_step), so an epoch costs ceil(micro-batches / grad_accum)
+            # and never the floor, which dropped the ragged tail into the next
+            # epoch's window. Divisible epochs are unchanged.
+            #
+            # num_train_epochs is a float and a fractional one is supported, so
+            # the epoch count multiplies the per-epoch step cost and the product
+            # is rounded up, exactly as transformers does in
+            # set_initial_training_values:
+            #   max_steps = ceil(num_train_epochs * num_update_steps_per_epoch)
+            # Truncating the epoch count instead silently shortened 1.5 to one
+            # epoch and stretched 0.5 to a full pass. Whole epoch counts are
+            # unchanged: ceil(E * steps_per_epoch) == E * steps_per_epoch.
+            steps_per_epoch = _mlx_steps_per_epoch(
+                epoch_microbatches, grad_accum,
+            )
+            epoch_count = (
+                n_batches / epoch_microbatches if includes_epochs
+                else float(args.num_train_epochs)
+            )
+            total_steps = math.ceil(epoch_count * steps_per_epoch)
         else:
             total_steps = n_batches // grad_accum
         return max(1, total_steps)
@@ -1102,6 +1507,7 @@ class MLXTrainer:
         args=None,
         formatting_func=None,
         processor=None,
+        callbacks=None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -1188,23 +1594,102 @@ class MLXTrainer:
         # Training state. Per-run tracking lives in _reset_run_state (re-run at
         # each train() so a reused trainer starts clean); callbacks and
         # pre-created batches persist across runs and stay here.
+        # stop_requested is cleared at train() entry, not in _reset_run_state, so
+        # a cancel raised during THIS run's setup survives; set here so a trainer
+        # inspected before train() has the attribute. _run_generation stamps each
+        # request, so that clear only drops an EARLIER run's stop.
+        self._run_generation = 0
+        self.stop_requested = False
         self._reset_run_state()
-        self.stop_requested = False  # Set True to stop training early
         self._batches = None  # Pre-created batches (skips internal batch creation)
         self._step_callbacks = []  # Callbacks called after each logged step
         self._eval_callbacks = []  # Callbacks called after each eval
 
+        # Hugging Face TrainerCallback support. The handler and TrainerState/
+        # TrainerControl persist across train() runs (callbacks are not reset
+        # in _reset_run_state); _init_callback_state re-seeds state at each run.
+        self._ensure_callback_args_compat()
+        self.callback_handler = _MLXCallbackHandler(
+            callbacks or [],
+            model=self.model,
+            processing_class=self.processor or self.tokenizer,
+            optimizer=None,
+            lr_scheduler=None,
+        )
+        # Seed the real per-rank process-zero flags BEFORE dispatching
+        # on_init_end (HF does the same). In DDP every rank constructs the
+        # trainer, so a callback that gates file I/O on
+        # state.is_world_process_zero during on_init_end would otherwise run once
+        # per rank (the default True-on-every-rank flags were only corrected later
+        # in _init_callback_state). self.is_main_process resolves the true rank
+        # (it triggers _ensure_distributed); each rank sets its own flag, so there
+        # is no lockstep concern.
+        _is_main = bool(self.is_main_process)
+        self.state = _MLXTrainerState(
+            is_local_process_zero=_is_main,
+            is_world_process_zero=_is_main,
+        )
+        self.control = _MLXTrainerControl()
+        # Dispatch on_init_end under the same DDP failure consensus as _fire: now
+        # that the process-zero flags are rank-specific, a callback that raises on
+        # rank 0 only (e.g. after gating an integration on is_world_process_zero)
+        # would otherwise unwind rank 0's __init__ while the peers proceed into
+        # train() and hang at the next collective. Catch the error and OR-reduce
+        # it so every rank aborts with the original exception surfaced. on_init_end
+        # runs on all ranks (HF fires it on every process; callbacks self-gate on
+        # the state flags); single-process re-raises unchanged.
+        _init_error = None
+        try:
+            self.control = self.callback_handler.call_event(
+                "on_init_end",
+                self.args, self.state, self.control,
+            )
+        except BaseException as e:
+            _init_error = e
+        if self.distributed_world_size > 1:
+            self._raise_distributed_failure(
+                _init_error is not None, "on_init_end callback", _init_error,
+            )
+        elif _init_error is not None:
+            raise _init_error
+
+    @property
+    def stop_requested(self):
+        """True while an early stop is pending. Externally owned: a controller
+        (e.g. the Studio cancel button) may set it at ANY time, even pre-train()."""
+        return self._stop_requested
+
+    @stop_requested.setter
+    def stop_requested(self, value):
+        self._stop_requested = value
+        # Stamp the request with its run generation, bumped when a run finishes:
+        # a stop latched by run N stamps N, a cancel raised after it stamps N+1.
+        # train() clears only the former, so a pre-train() cancel is never lost.
+        self._stop_requested_generation = getattr(self, "_run_generation", 0)
+
+    def _stop_request_generation(self):
+        """Generation the pending stop request was made in (0 when unset)."""
+        return getattr(self, "_stop_requested_generation", 0)
+
     def _reset_run_state(self):
-        """Per-run training/metric state. Reset from __init__ and at the start
-        of each train() so reusing a trainer for a second run starts clean;
-        _early_stopped cleared so a run-1 early stop doesn't block run 2.
-        stop_requested is deliberately not reset: it is externally owned (a
-        controller thread may set it at any moment, including during train()
-        setup and batch prep), so clearing it here would silently drop an
-        in-flight cancel. Callbacks and pre-created batches persist across
-        runs and aren't reset."""
+        """Per-run training/metric state. Reset from __init__ and inside
+        _train_inner (after setup) so reusing a trainer for a second run starts
+        clean; _early_stopped cleared so a run-1 early stop doesn't block run 2.
+        stop_requested is deliberately NOT reset here: train() clears it once at
+        entry (before any data prep / optimizer build), so an external cancel
+        raised DURING this run's setup survives to the loop's top-of-loop
+        _distributed_should_stop() check instead of being clobbered by this
+        post-setup reset. Callbacks and pre-created batches persist across runs
+        and aren't reset."""
         self._global_step = 0
         self._train_loss_history = []
+        # Running token-weighted totals behind the returned train_loss.
+        # _train_loss_history holds per-window means over unequal token counts, so
+        # averaging those unweighted makes the result depend on the log cadence,
+        # which any callback setting control.should_log can move.
+        self._train_loss_token_sum = 0.0
+        self._train_loss_token_total = 0
+        self._train_loss_weighting_ok = True
         self._grad_norm_history = []
         self._tokens_per_second_history = []
         self._peak_memory_history = []
@@ -1219,6 +1704,23 @@ class MLXTrainer:
         self._best_metric = None
         self._best_step = None
         self._es_patience_counter = 0
+        # Restored from a checkpoint's saved num_input_tokens_seen by the resume
+        # block; 0 on a fresh run so a reused trainer starts the counter clean.
+        self._resume_num_input_tokens_seen = 0
+        # Same contract for the checkpoint's callback-visible epoch: None on a
+        # fresh run, so a reused trainer opens at HF's unstarted-epoch value.
+        self._resume_epoch = None
+        # Same contract for the checkpoint's ExportableState callback states, so a
+        # reused trainer does not re-expose run-1's bookkeeping. HF rebuilds these
+        # from the LIVE callbacks each run, reading trainer_state.json only on resume.
+        self._resume_stateful_callbacks = {}
+        # Same for the callback-visible log history: restored by the resume
+        # block, empty on a fresh run so a reused trainer carries nothing over.
+        self._resume_log_history = []
+        # Same for TrainerState.best_metric: restored by the resume block, None
+        # on a fresh run so a reused trainer drops run-1's watermark.
+        self._resume_callback_best_metric = None
+        self._resume_callback_best_step = None
         self._distributed_world = None
         self._distributed_initialized = False
         self._distributed_rank = 0
@@ -1627,6 +2129,30 @@ class MLXTrainer:
             self.stop_requested = True
         return should_stop
 
+    def _distributed_sync_control_actions(self):
+        """OR the callback log/eval/save requests across ranks.
+
+        Callbacks fire on every rank, but a rank-dependent one can still flip
+        control.should_log / should_evaluate / should_save on a subset. Those
+        actions run collective code (metric all-reduce, eval, rank-0-guarded
+        saves), so every rank must agree before entering them or the peers
+        deadlock at the collective. One packed all-sum keeps the flags in
+        lockstep; a no-op at world size 1.
+        """
+        world = self._ensure_distributed()
+        if world is None or self._distributed_world_size <= 1:
+            return
+        base = self._distributed_world_size + 1
+        code = (
+            int(bool(self.control.should_log))
+            + base * int(bool(self.control.should_evaluate))
+            + base * base * int(bool(self.control.should_save))
+        )
+        total = self._distributed_status_mask(code)
+        self.control.should_log = (total % base) > 0
+        self.control.should_evaluate = ((total // base) % base) > 0
+        self.control.should_save = ((total // (base * base)) % base) > 0
+
     def _distributed_eval_status(self, failed=False):
         """Synchronize eval stop/failure state with one rank-wide collective."""
         status_base = self.distributed_world_size + 1
@@ -1712,6 +2238,597 @@ class MLXTrainer:
         fn(step, eval_loss, perplexity)
         """
         self._eval_callbacks.append(fn)
+
+    def add_callback(self, callback):
+        """Add a Hugging Face TrainerCallback class or instance."""
+        self.callback_handler.add_callback(callback)
+        self._ensure_callback_args_compat()
+
+    def remove_callback(self, callback):
+        """Remove a Hugging Face TrainerCallback class or instance."""
+        self.callback_handler.remove_callback(callback)
+
+    def pop_callback(self, callback):
+        """Remove and return a Hugging Face TrainerCallback class or instance."""
+        return self.callback_handler.pop_callback(callback)
+
+    def _suppress_torch_only_final_artifacts(self):
+        """Disable HF final-model artifacts for one on_train_end dispatch.
+
+        WandbCallback.on_train_end and DVCLiveCallback.on_train_end both log that
+        artifact by building a Torch ``Trainer`` around ``args``/``model``, which
+        raises AttributeError here (``full_determinism`` on 5.x,
+        ``batch_eval_metrics`` on 4.57.x). Adapters are already saved by then, so
+        the casualty is the caller's MLXTrainOutput -- and for DVCLive also the
+        ``self.live.end()`` that trails the artifact block, leaving the tracked
+        run unfinalized. Per-checkpoint artifacts are untouched: neither on_save
+        builds a Trainer, and DVCLive's ``log_model="all"`` (its per-checkpoint
+        mode) never enters the Trainer branch, which upstream gates on
+        ``self._log_model is True``. Returns (callback, previous_mode) pairs for
+        _restore_final_artifact_modes. Duck-typed so unsloth_zoo.mlx still
+        imports without Torch.
+        """
+        suppressed = []
+        for callback in getattr(self.callback_handler, "callbacks", ()):
+            # Match the MRO, not just the concrete class: subclassing an
+            # integration callback to customise logging is a common recipe and
+            # inherits the same on_train_end.
+            names = {base.__name__ for base in type(callback).__mro__}
+            mode = getattr(callback, "_log_model", None)
+            if "WandbCallback" in names:
+                if mode is None or not getattr(mode, "is_enabled", False):
+                    continue
+                try:
+                    # WandbLogModel is a str Enum, so the "false" member is
+                    # reachable from the instance without importing transformers.
+                    disabled = type(mode)("false")
+                except Exception:
+                    continue
+                if getattr(disabled, "is_enabled", True):
+                    continue
+            elif "DVCLiveCallback" in names:
+                # Mirror upstream's identity test, so "all" keeps logging its
+                # per-checkpoint artifact (on_save, no Trainer) untouched.
+                if mode is not True:
+                    continue
+                disabled = False
+            else:
+                continue
+            callback._log_model = disabled
+            suppressed.append((callback, mode))
+        return suppressed
+
+    def _restore_final_artifact_modes(self, suppressed):
+        """Undo _suppress_torch_only_final_artifacts on the user's callbacks."""
+        for callback, mode in suppressed:
+            callback._log_model = mode
+
+    def _ensure_callback_args_compat(self):
+        """Populate TrainingArguments-style fields read by common callbacks."""
+        args = self.args
+        self._sync_synthesized_arg(
+            "logging_strategy",
+            "steps" if getattr(args, "logging_steps", 0) else "no",
+        )
+        self._sync_synthesized_arg(
+            "eval_strategy", self._default_callback_eval_strategy(),
+        )
+        self._sync_synthesized_arg(
+            "save_strategy",
+            "steps" if getattr(args, "save_steps", 0) else "no",
+        )
+        if not hasattr(args, "logging_first_step"):
+            args.logging_first_step = False
+        if not hasattr(args, "eval_delay"):
+            args.eval_delay = 0
+        if not hasattr(args, "include_num_input_tokens_seen"):
+            args.include_num_input_tokens_seen = False
+        # Integration-facing fields, at HF's own TrainingArguments defaults.
+        # TrackioCallback and SwanLabCallback read them directly in
+        # on_train_begin, so a missing one aborts the run before step 1.
+        if not hasattr(args, "project"):
+            args.project = "huggingface"
+        for _integration_arg in (
+            "trackio_space_id", "trackio_bucket_id", "trackio_static_space_id",
+            "hub_private_repo", "resume_from_checkpoint",
+        ):
+            if not hasattr(args, _integration_arg):
+                setattr(args, _integration_arg, None)
+        if getattr(args, "logging_dir", None) is None:
+            args.logging_dir = os.path.join(args.output_dir, "runs")
+        if getattr(args, "run_name", None) is None:
+            args.run_name = args.output_dir
+
+    def _sync_synthesized_arg(self, name, value):
+        """Set a callback-compat arg we synthesized, refreshing it per run.
+
+        These strategies derive from MLX knobs that stay writable after
+        construction, so without a per-run refresh a trainer built without eval
+        keeps eval_strategy="no" once eval is enabled later and HF's
+        EarlyStoppingCallback asserts in on_train_begin. Only values this trainer
+        wrote are refreshed; a real field or a user override is never clobbered.
+        """
+        args = self.args
+        synthesized = getattr(self, "_synthesized_callback_args", None)
+        if synthesized is None:
+            synthesized = self._synthesized_callback_args = {}
+        current = getattr(args, name, None)
+        if name in synthesized:
+            # Someone changed our value by hand: theirs wins from now on.
+            if current != synthesized[name]:
+                del synthesized[name]
+                return
+        elif hasattr(args, name) and current is not None:
+            return
+        setattr(args, name, value)
+        synthesized[name] = value
+
+    def _default_callback_eval_strategy(self):
+        """Return the MLX-derived eval strategy for callback compatibility."""
+        return (
+            "steps"
+            if self.eval_dataset is not None and getattr(self.args, "eval_steps", 0)
+            else "no"
+        )
+
+    def _static_cadence_enabled(self, name):
+        """Whether the loop's own step cadence applies, as HF decides it.
+
+        _sync_synthesized_arg deliberately preserves a caller-supplied strategy
+        (a real TrainingArguments/SFTConfig carries one, and a hand-set override
+        wins over our derivation), so the loop must read the same field HF's
+        DefaultFlowCallback reads instead of acting on the interval alone.
+        transformers only raises a step-interval action under
+        IntervalStrategy/SaveStrategy.STEPS (trainer_callback.
+        DefaultFlowCallback.on_step_end), so "no" must not act at all and
+        "epoch" must leave the cadence to on_epoch_end rather than adding a
+        second action on top of it.
+
+        Both are str Enums, so a plain "steps" and the member itself normalize
+        here. A missing field means the args object never went through
+        _ensure_callback_args_compat, so keep the legacy interval-only cadence
+        rather than silently disabling the action.
+        """
+        strategy = getattr(self.args, name, None)
+        if strategy is None:
+            return True
+        strategy = getattr(strategy, "value", strategy)
+        return str(strategy).lower() == "steps"
+
+    def _static_eval_cadence_enabled(self):
+        """Whether the loop's own eval_steps cadence applies."""
+        return self._static_cadence_enabled("eval_strategy")
+
+    def _static_log_cadence_enabled(self):
+        """Whether the loop's own logging_steps cadence applies."""
+        return self._static_cadence_enabled("logging_strategy")
+
+    def _static_save_cadence_enabled(self):
+        """Whether the loop's own save_steps cadence applies."""
+        return self._static_cadence_enabled("save_strategy")
+
+    def _best_save_strategy_enabled(self):
+        """Whether save_strategy asks for HF's save-on-improvement rule.
+
+        SaveStrategy.BEST (transformers >= 4.47) is the one member
+        DefaultFlowCallback never raises: its on_step_end and on_epoch_end act
+        on STEPS and EPOCH only, so HF's Trainer core decides this one itself,
+        immediately after the evaluation that produced the metric. Gating the
+        static cadence on the strategy therefore left "best" with no cadence at
+        all -- the same hole the epoch cadence fills for "epoch". Same str-Enum
+        normalization as the other two; a missing field is not "best".
+        """
+        strategy = getattr(self.args, "save_strategy", None)
+        if strategy is None:
+            return False
+        strategy = getattr(strategy, "value", strategy)
+        return str(strategy).lower() == "best"
+
+    def _epoch_cadence_enabled(self, name):
+        """Whether a strategy field asks for HF's epoch cadence.
+
+        The mirror of _static_cadence_enabled for the other half of the flow,
+        DefaultFlowCallback.on_epoch_end, which raises its action under
+        IntervalStrategy/SaveStrategy.EPOCH. Same str-Enum normalization; a
+        missing field means the args object never went through
+        _ensure_callback_args_compat, so it keeps the legacy interval-only
+        cadence and gains no epoch action it never asked for.
+        """
+        strategy = getattr(self.args, name, None)
+        if strategy is None:
+            return False
+        strategy = getattr(strategy, "value", strategy)
+        return str(strategy).lower() == "epoch"
+
+    def _request_epoch_cadence_actions(self):
+        """Raise the epoch-strategy log/eval/save requests at a dataset boundary.
+
+        transformers' Trainer always installs DefaultFlowCallback, so its
+        on_epoch_end is what turns a caller's "epoch" strategy into an action.
+        MLXTrainer installs no flow callback of its own, so gating the loop's
+        static interval on the strategy (see _static_cadence_enabled) would
+        otherwise leave a caller who hand-sets "epoch" and passes their own
+        callbacks with NO periodic log, checkpoint or evaluation at all -- worse
+        than the wrong-cadence bug that gating fixes. Raise the same requests
+        here so the cadence holds either way.
+
+        Deduplicated against an installed flow by construction: this sets
+        exactly the control flags DefaultFlowCallback.on_epoch_end sets, so the
+        two requests coalesce into the single boolean the loop already clears
+        when it runs the action (CallbackHandler.on_log/on_evaluate/on_save
+        clear theirs the same way) -- one on_save, one checkpoint-N write, one
+        eval_loss in log_history per boundary. It adds no repeat of its own:
+        every boundary that already dispatched on_epoch_end now carries the
+        request, and no boundary is visited twice. Callers invoke this
+        immediately BEFORE firing on_epoch_end, which is also where HF raises it
+        (the flow sits at index 0 of the callback list), so the callbacks that
+        follow observe the same control state they would under HF.
+
+        This does not, and cannot, deduplicate ACROSS boundaries: when an epoch
+        is shorter than one accumulation window (_mlx_epoch_microbatches returns
+        None under max_steps for a source with no cycle_length, so the ragged
+        tail is not forced to an optimizer step) the loop dispatches several
+        on_epoch_end events at one global_step and repeats the action at each,
+        exactly as it already does for a caller who installs the flow.
+
+        DDP-safe with no collective of its own: args and state.epoch are
+        rank-consistent, and every call site sits on the near side of the
+        _distributed_sync_control_actions() that follows the on_epoch_end fire,
+        which OR-reduces the flags before any rank enters the collective
+        log/eval/save paths.
+        """
+        if self._epoch_cadence_enabled("logging_strategy"):
+            self.control.should_log = True
+        if self._epoch_cadence_enabled("eval_strategy"):
+            # on_epoch_end compares eval_delay against state.epoch, not the step
+            # its on_step_end gate uses. state.epoch is set by the caller before
+            # this runs; the None fallback only covers helper paths with no
+            # epoch length, which never reach a boundary anyway.
+            epoch = getattr(self.state, "epoch", None)
+            if epoch is None or self._eval_delay_satisfied(epoch):
+                self.control.should_evaluate = True
+        if self._epoch_cadence_enabled("save_strategy"):
+            self.control.should_save = True
+
+    def _request_step_cadence_actions(self):
+        """Raise the non-interval requests DefaultFlowCallback.on_step_end makes.
+
+        The loop's static interval (see _static_cadence_enabled) covers the
+        periodic half of DefaultFlowCallback.on_step_end. This covers the rest:
+        the logging_first_step log at step 1, and the save/eval HF forces once
+        state.global_step reaches state.max_steps. MLXTrainer installs no flow
+        callback of its own, so without these a run whose interval does not
+        divide the step budget silently lost its LAST resumable checkpoint --
+        checkpoint-<max_steps> and its on_save, the one an interrupted run
+        resumes from, which the unconditional final save_model() cannot replace
+        because it holds adapters only, no optimizer or trainer state -- and, on
+        a transformers that forces one, the final evaluation that
+        load_best_model_at_end and EarlyStoppingCallback read last.
+
+        Deduplicated against an installed flow exactly like
+        _request_epoch_cadence_actions: these are the control flags
+        DefaultFlowCallback sets, so both requests coalesce into the single
+        boolean the loop clears when it runs the action -- one on_save, one
+        checkpoint-N write, one eval_loss in log_history. Callers raise it
+        immediately BEFORE on_step_end, which is where the flow raises it (index
+        0 of the callback list), so the callbacks that follow observe the same
+        control state they would under HF.
+
+        The final-step test reads state.max_steps, the same fixed field HF's
+        flow tests, not the loop's live budget: a run whose budget
+        _honor_epoch_stop_skip shrank stops short of max_steps and gets no
+        forced final action, with or without a flow installed.
+
+        DDP-safe with no collective of its own: args and state are
+        rank-consistent, and every call site sits on the near side of the
+        _distributed_sync_control_actions() that follows the on_step_end fire.
+        """
+        args = self.args
+        current_step = int(getattr(self.state, "global_step", 0) or 0)
+        # Deliberately not gated on logging_strategy: HF raises the first-step
+        # log before it tests the strategy, so "no" and "epoch" log step 1 too.
+        if current_step == 1 and getattr(args, "logging_first_step", False):
+            self.control.should_log = True
+        max_steps = int(getattr(self.state, "max_steps", 0) or 0)
+        if max_steps <= 0 or current_step < max_steps:
+            return
+        # HF forces the final save from the strategy alone, with no save_steps
+        # guard, so an interval that does not divide the budget still leaves a
+        # checkpoint at the end.
+        if self._static_save_cadence_enabled():
+            self.control.should_save = True
+        eval_steps = int(getattr(self.state, "eval_steps", 0) or 0)
+        if (
+            _default_flow_evaluates_final_step()
+            # HF skips the forced eval when the interval already evaluated here.
+            # Its modulo has no zero guard; a 0 interval means "never" for the
+            # loop's own cadence, so keep it meaning that rather than raising.
+            and eval_steps > 0
+            and current_step % eval_steps != 0
+            and self._static_eval_cadence_enabled()
+            and self._eval_delay_satisfied(current_step)
+        ):
+            self.control.should_evaluate = True
+
+    def _eval_delay_satisfied(self, current_step):
+        """Whether HF's eval_delay allows the step cadence to evaluate yet.
+
+        DefaultFlowCallback gates its step-strategy evaluation on
+        `args.eval_delay <= state.global_step`, so the static cadence honors
+        the same bound. _ensure_callback_args_compat defaults the field to 0,
+        and an unparseable value falls back to "no delay" so a bad override
+        cannot disable evaluation outright.
+        """
+        try:
+            delay = float(getattr(self.args, "eval_delay", 0) or 0)
+        except (TypeError, ValueError):
+            return True
+        return delay <= float(current_step)
+
+    def _callback_num_train_epochs(self, total_steps, batches):
+        """Return the epoch total HF's TrainerState reports for this run.
+
+        Epoch-count runs use num_train_epochs directly. A max_steps run
+        derives the total from the dataloader length as HF does: reporting 0
+        while the loop dispatches epoch events contradicts state.epoch and
+        divides by zero downstream.
+
+        The count is CEILED, like HF's `num_train_epochs =
+        math.ceil(args.num_train_epochs)` (transformers
+        set_initial_training_values) and like the step budget, which already
+        ceils. Truncating it reported 1 for num_train_epochs=1.5 while
+        state.epoch still climbed to 1.5, so a callback normalizing progress by
+        this total read 150 percent.
+        """
+        epochs = max(0, math.ceil(float(
+            getattr(self.args, "num_train_epochs", 0) or 0
+        )))
+        # HF derives the total from max_steps whenever it is set, ignoring
+        # num_train_epochs, which a real TrainingArguments leaves positive.
+        if epochs > 0 and int(getattr(self.args, "max_steps", 0) or 0) <= 0:
+            return epochs
+        total_steps = int(total_steps or 0)
+        if total_steps <= 0:
+            return epochs
+        micro_per_epoch = self._callback_batches_per_epoch(batches)
+        if not micro_per_epoch:
+            # Streaming: no known boundaries, so the loop fires no epoch events.
+            return epochs
+        grad_accum = max(1, int(getattr(self.args, "gradient_accumulation_steps", 1) or 1))
+        updates_per_epoch = max(1, math.ceil(micro_per_epoch / grad_accum))
+        return max(1, math.ceil(total_steps / updates_per_epoch))
+
+    def _init_callback_state(self, total_steps, resume_step, batches=None):
+        """Initialize TrainerState for HF callback lifecycle events."""
+        args = self.args
+        # Expand HF's fractional (ratio-of-total-steps) intervals to absolute
+        # counts before storing them, as TrainerState.compute_steps does.
+        eval_steps = _resolve_interval_steps(
+            getattr(args, "eval_steps", 0), total_steps,
+        )
+        # Reflect the real MLX rank so HF callbacks (loggers, savers) gate their
+        # own I/O correctly. MLX distributed is single-node, so local and world
+        # process-zero both track rank 0.
+        is_main_process = self.is_main_process
+        self.state = _MLXTrainerState(
+            global_step=int(resume_step),
+            # The checkpoint's epoch on resume (None on a fresh run), so the
+            # lifecycle events dispatched before the loop rebuilds epoch
+            # progress carry the same value HF restores from trainer_state.json.
+            epoch=getattr(self, "_resume_epoch", None),
+            max_steps=int(total_steps),
+            logging_steps=_resolve_interval_steps(
+                getattr(args, "logging_steps", 0), total_steps,
+            ),
+            eval_steps=eval_steps,
+            save_steps=_resolve_interval_steps(
+                getattr(args, "save_steps", 0), total_steps,
+            ),
+            train_batch_size=int(getattr(args, "per_device_train_batch_size", 0) or 0),
+            num_train_epochs=self._callback_num_train_epochs(total_steps, batches),
+            num_input_tokens_seen=int(
+                getattr(self, "_resume_num_input_tokens_seen", 0) or 0
+            ),
+            # Continue the checkpoint's history on resume (HF restores the whole
+            # TrainerState from trainer_state.json); empty on a fresh run.
+            log_history=list(getattr(self, "_resume_log_history", None) or []),
+            is_local_process_zero=is_main_process,
+            is_world_process_zero=is_main_process,
+        )
+        # Seed the callback-visible best-model fields from the restored native
+        # best state (set by the resume block before this call; None on a fresh
+        # run). Otherwise a resumed run starts with state.best_metric=None, so
+        # _update_callback_best_metric and HF callbacks like EarlyStoppingCallback
+        # treat the first post-resume eval as the new best and can overwrite the
+        # real best with a worse metric, diverging from the native best-model
+        # tracking in _run_best_tracking (which uses the restored self._best_metric).
+        # Own checkpoint key, since it advances even when native tracking is off;
+        # falls back to the native value on fresh runs and pre-fix checkpoints.
+        _cb_best_metric = getattr(self, "_resume_callback_best_metric", None)
+        _cb_best_step = getattr(self, "_resume_callback_best_step", None)
+        self.state.best_metric = (
+            self._best_metric if _cb_best_metric is None else _cb_best_metric
+        )
+        self.state.best_global_step = (
+            self._best_step if _cb_best_step is None else _cb_best_step
+        )
+        if self._best_step is not None:
+            self.state.best_model_checkpoint = f"{args.output_dir}/best"
+        self.control = _MLXTrainerControl()
+
+    def _sync_callback_stop(self):
+        """Mirror TrainerControl stop requests into MLXTrainer's loop flag."""
+        if getattr(self.control, "should_training_stop", False):
+            self.stop_requested = True
+
+    def _call_callback_log(self, logs):
+        """Record and dispatch a Hugging Face on_log callback event."""
+        if self.state.epoch is not None:
+            logs["epoch"] = self.state.epoch
+        output = dict(logs)
+        output["step"] = self.state.global_step
+        self.state.log_history.append(output)
+        self.control.should_log = False
+        self.control = self.callback_handler.call_event(
+            "on_log",
+            self.args, self.state, self.control, logs=logs,
+        )
+
+    def _call_callback_evaluate(self, metrics):
+        """Dispatch a Hugging Face on_evaluate callback event."""
+        self._call_callback_log(dict(metrics))
+        self.control.should_evaluate = False
+        self.control = self.callback_handler.call_event(
+            "on_evaluate",
+            self.args, self.state, self.control, metrics=metrics,
+        )
+
+    def _call_callback_save(self):
+        """Dispatch a Hugging Face on_save callback event."""
+        self.control.should_save = False
+        self.control = self.callback_handler.call_event(
+            "on_save",
+            self.args, self.state, self.control,
+        )
+
+    def _callback_batches_per_epoch(self, batches):
+        """Return the finite micro-batch count for one callback epoch."""
+        if batches is None:
+            return None
+        total = len(batches)
+        if total <= 0:
+            return None
+        # Epoch-count runs share this length with the step budget and the forced
+        # epoch-final update, so both read it from one place.
+        epoch_microbatches = _mlx_epoch_microbatches(
+            self.args,
+            batches,
+            includes_epochs=getattr(
+                self, "_prepared_batches_include_epochs", False,
+            ),
+        )
+        if epoch_microbatches:
+            return epoch_microbatches
+        if getattr(self, "_prepared_batches_include_epochs", False):
+            epochs = int(getattr(self.args, "num_train_epochs", 0) or 0)
+            if epochs > 0 and total % epochs == 0:
+                return max(1, total // epochs)
+            return total
+        # max_steps>0 path: `batches` is the whole cycled/truncated run
+        # (max_steps * grad_accum micro-batches), NOT one dataset pass, so using
+        # it as the epoch length makes state.epoch climb to 1.0 across the entire
+        # run and fires on_epoch_begin/end exactly once, starving epoch-based HF
+        # callbacks on small finite datasets. Approximate the true per-epoch
+        # micro-batch count from the dataset size and the global batch (each
+        # micro-batch consumes per_device_train_batch_size * world_size rows),
+        # matching HF's len(dataloader)-based epoch accounting for max_steps. This
+        # only affects the callback-visible epoch value/cadence, never the
+        # training data or gradient steps. Floored at 1 but never upper-clamped:
+        # a sub-one-pass max_steps run (max_steps < one dataset pass) must report
+        # the true fractional epoch (e.g. state.epoch ~ 0.1), matching HF, not a
+        # spurious full 1.0.
+        if int(getattr(self.args, "max_steps", 0) or 0) > 0:
+            # Prefer the plan's own one-pass count: the approximation below
+            # cannot see what batching retained (sub-two-token rows dropped, one
+            # source item expanding into several, floored tail), so it fires the
+            # epoch events at micro-batches that are not dataset boundaries.
+            plan_cycle = getattr(batches, "cycle_length", None)
+            if plan_cycle:
+                return max(1, int(plan_cycle))
+            per_device = int(getattr(self.args, "per_device_train_batch_size", 0) or 0)
+            world = int(getattr(self, "_distributed_world_size", 1) or 1)
+            ds = getattr(self, "_mlx_train_dataset_for_batches", None)
+            if ds is None:
+                ds = self.train_dataset
+            try:
+                n_examples = len(ds)
+            except TypeError:
+                n_examples = 0
+            if per_device > 0 and n_examples > 0:
+                one_pass = math.ceil(n_examples / (per_device * max(1, world)))
+                return max(1, one_pass)
+        return total
+
+    def _metric_for_best_model_name(self, metrics=None, require=False):
+        """Return the HF-normalized metric_for_best_model key."""
+        metric_name = getattr(self.args, "metric_for_best_model", None)
+        if not metric_name:
+            return None
+        metric_name = str(metric_name)
+        if not metric_name.startswith("eval_"):
+            metric_name = f"eval_{metric_name}"
+        if metrics is not None and metric_name not in metrics:
+            if require:
+                raise ValueError(
+                    f"metric_for_best_model={metric_name!r} not in eval "
+                    f"metrics; available: {sorted(metrics)}"
+                )
+            return None
+        return metric_name
+
+    def _export_callback_states(self):
+        """Populate state.stateful_callbacks from ExportableState callbacks.
+
+        HF does this in _save_checkpoint, so a callback's internal bookkeeping
+        (EarlyStoppingCallback.early_stopping_patience_counter) travels with the
+        checkpoint. Duck-typed on a working `state()` to keep this module
+        Torch-free. TrainerControl is excluded: MLX rebuilds control flags every
+        train(), and rehydrating should_training_stop would end a resume at step 0.
+        """
+        exported = {}
+        for cb in self.callback_handler.callbacks:
+            state_fn = getattr(cb, "state", None)
+            if not callable(state_fn):
+                continue
+            try:
+                cb_state = state_fn()
+            except NotImplementedError:
+                continue  # ExportableState base, or a non-exporting callback
+            if not isinstance(cb_state, dict):
+                continue
+            name = type(cb).__name__
+            if name in exported:
+                # HF stores duplicates of one class as a list, positionally
+                # matched back to the callbacks on restore.
+                if not isinstance(exported[name], list):
+                    exported[name] = [exported[name]]
+                exported[name].append(cb_state)
+            else:
+                exported[name] = cb_state
+        self.state.stateful_callbacks = exported
+        return exported
+
+    def _restore_callback_states(self, stateful_callbacks):
+        """Seed state.stateful_callbacks from a checkpoint. Rehydrating the live
+        callbacks is HF's opt-in restore_callback_states_from_checkpoint path,
+        which this config does not expose, so only the visible state is mirrored."""
+        if isinstance(stateful_callbacks, dict) and stateful_callbacks:
+            self.state.stateful_callbacks = dict(stateful_callbacks)
+
+    def _update_callback_best_metric(self, metrics):
+        """Update TrainerState.best_metric after eval callbacks inspect prior state.
+
+        Returns whether this evaluation is a new best, like HF's
+        _determine_best_metric, so save_strategy="best" can act on it. No
+        configured metric and a NaN both mean "not a new best", which is also
+        what HF concludes (metric_for_best_model None short-circuits its
+        is_new_best_metric to False, and np.less/np.greater are False on NaN).
+        """
+        metric_name = self._metric_for_best_model_name(metrics, require=False)
+        if metric_name is None:
+            return False
+        value = metrics[metric_name]
+        if value != value:
+            return False
+        greater = bool(getattr(self.args, "greater_is_better", False))
+        improved = (
+            self.state.best_metric is None
+            or (value > self.state.best_metric if greater else value < self.state.best_metric)
+        )
+        if improved:
+            self.state.best_metric = value
+            self.state.best_global_step = self.state.global_step
+        return improved
 
     @staticmethod
     def _apply_compile_recommendations(args, decision):
@@ -2052,6 +3169,58 @@ class MLXTrainer:
                 unsupported.append((name, tuple(getattr(value, "shape", ()))))
         return unsupported
 
+    def _fire_prediction_step(self):
+        """Dispatch HF's on_prediction_step for one processed eval batch.
+
+        transformers fires this once per evaluation batch from its evaluation
+        loop (`self.control = self.callback_handler.on_prediction_step(args,
+        self.state, self.control)` in Trainer.evaluation_loop), which is how
+        stock ProgressCallback advances its evaluation bar and how per-batch
+        evaluation instrumentation is notified. The handler passes its
+        eval_dataloader through, so a sized batch list gives ProgressCallback a
+        real total and a lazy view (no __len__) makes it no-op, like HF's own
+        has_length guard.
+
+        No-ops when the handler is absent: _evaluate is reachable from helper
+        paths that never built one, and evaluation must not start depending on
+        the callback bridge to produce a loss.
+        """
+        handler = getattr(self, "callback_handler", None)
+        if handler is None:
+            return
+        self.control = handler.call_event(
+            "on_prediction_step", self.args, self.state, self.control,
+        )
+
+    def _close_split_prediction_bars(self):
+        """End per-split evaluation progress bars when eval_dataloader rotates.
+
+        HF scores one eval_dataset split per evaluate() call, so its per-split
+        on_evaluate closes ProgressCallback's prediction bar before the next
+        split opens a new one sized to that split. MLX reports the whole dict as
+        one evaluation, so without this the first split's bar keeps counting
+        every later split's batch past its own total (2/2 climbing to 9/2 across
+        three splits). The last split's bar is still closed by on_evaluate, as
+        in HF. Duck-typed to keep this module Torch-free, and a no-op on ranks
+        and callbacks that never opened a bar.
+        """
+        for callback in getattr(
+            getattr(self, "callback_handler", None), "callbacks", ()
+        ) or ():
+            bar = getattr(callback, "prediction_bar", None)
+            if bar is None:
+                continue
+            close = getattr(bar, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass  # a display failure must not abort the evaluation
+            try:
+                callback.prediction_bar = None
+            except AttributeError:
+                pass  # read-only attribute; the close above already ended it
+
     def _evaluate_batch_totals(self, eval_batches, loss_fn, is_vlm=False):
         """Accumulate weighted loss totals for one flat eval batch stream."""
         all_losses = mx.array(0.0)
@@ -2091,6 +3260,13 @@ class MLXTrainer:
                     all_losses += mx.where(ntoks > 0, loss * ntoks, 0.0)
                     ntokens += ntoks
                     mx.eval(all_losses, ntokens)
+                    # HF dispatches on_prediction_step after each evaluation
+                    # batch is folded into the running totals. Raised inside
+                    # this try on purpose: a callback that fails on one rank
+                    # then joins the same _distributed_eval_status consensus as
+                    # a failed batch, so the peers abort together instead of
+                    # hanging at the next collective.
+                    self._fire_prediction_step()
                 except BaseException as exc:
                     failed = True
                     error = exc
@@ -2187,25 +3363,41 @@ class MLXTrainer:
         if isinstance(eval_batches, dict):
             all_losses = mx.array(0.0)
             ntokens = mx.array(0)
-            for split_name, split_batches in eval_batches.items():
-                split_losses, split_tokens = self._evaluate_batch_totals(
-                    split_batches, loss_fn, is_vlm=is_vlm,
-                )
-                split_losses = self._distributed_all_sum(split_losses, stream=mx.cpu)
-                split_tokens = self._distributed_all_sum(split_tokens, stream=mx.cpu)
-                all_losses += split_losses
-                ntokens += split_tokens
-                mx.eval(all_losses, ntokens)
-                split_loss = (
-                    (split_losses / split_tokens).item()
-                    if split_tokens.item() > 0 else 0.0
-                )
-                split_ppl = math.exp(min(split_loss, 100))
-                split_prefix = f"eval_{split_name}"
-                metrics[f"{split_prefix}_loss"] = split_loss
-                metrics[f"{split_prefix}_perplexity"] = split_ppl
-                if self._distributed_should_stop():
-                    break
+            # HF evaluates one split at a time and rebuilds its eval_dataloader
+            # per split, so on_prediction_step reports the split being consumed
+            # rather than the dict of splits (whose len is the split count, and
+            # would give ProgressCallback a nonsense bar total).
+            handler = getattr(self, "callback_handler", None)
+            outer_dataloader = getattr(handler, "eval_dataloader", None)
+            try:
+                for split_index, (split_name, split_batches) in enumerate(
+                    eval_batches.items()
+                ):
+                    if handler is not None:
+                        if split_index:
+                            self._close_split_prediction_bars()
+                        handler.eval_dataloader = split_batches
+                    split_losses, split_tokens = self._evaluate_batch_totals(
+                        split_batches, loss_fn, is_vlm=is_vlm,
+                    )
+                    split_losses = self._distributed_all_sum(split_losses, stream=mx.cpu)
+                    split_tokens = self._distributed_all_sum(split_tokens, stream=mx.cpu)
+                    all_losses += split_losses
+                    ntokens += split_tokens
+                    mx.eval(all_losses, ntokens)
+                    split_loss = (
+                        (split_losses / split_tokens).item()
+                        if split_tokens.item() > 0 else 0.0
+                    )
+                    split_ppl = math.exp(min(split_loss, 100))
+                    split_prefix = f"eval_{split_name}"
+                    metrics[f"{split_prefix}_loss"] = split_loss
+                    metrics[f"{split_prefix}_perplexity"] = split_ppl
+                    if self._distributed_should_stop():
+                        break
+            finally:
+                if handler is not None:
+                    handler.eval_dataloader = outer_dataloader
         else:
             all_losses, ntokens = self._evaluate_batch_totals(
                 eval_batches, loss_fn, is_vlm=is_vlm,
@@ -2553,6 +3745,17 @@ class MLXTrainer:
     def train(self, resume_from_checkpoint: str | None = None):
         """Run MLX-native training loop following mlx-lm's compiled-step pattern
         with gradient accumulation. Returns a dict of training metrics."""
+        # Clear a PRIOR run's stale stop at the EARLIEST point, before any setup,
+        # so a reused trainer starts un-stopped. Only a stop stamped by an EARLIER
+        # generation is cleared, so a cancel raised DURING this run's setup (a
+        # Studio cancel while _prepare_data materializes) survives to the loop's
+        # _distributed_should_stop(). Local assignment only, no DDP collective.
+        if self._stop_request_generation() < getattr(self, "_run_generation", 0):
+            self.stop_requested = False
+        # Then release the previous run's iterator/prefetch producer. Ordered
+        # after the stop clear because that clear is a local assignment that
+        # cannot fail, while this can block or propagate an interrupt; running it
+        # first would leave a stale stop latched for the next train() call.
         self._close_active_batch_iterator()
         # Stash for _train_inner. None = fresh start, a path = resume.
         self._resume_from_checkpoint = resume_from_checkpoint
@@ -2582,7 +3785,7 @@ class MLXTrainer:
                     ),
                 )
                 compile_policy = build_compile_policy(args=args)
-            except Exception as exc:
+            except BaseException as exc:
                 preflight_error = exc
             if self.distributed_world_size > 1:
                 self._raise_distributed_failure(
@@ -2610,6 +3813,9 @@ class MLXTrainer:
                     distributed_world_size=self.distributed_world_size,
                     compile_policy=compile_policy,
                     install_plan=False,
+                    includes_epochs=getattr(
+                        self, "_prepared_batches_include_epochs", False,
+                    ),
                 )
             except Exception as exc:
                 local_plan_error = exc
@@ -2793,6 +3999,9 @@ class MLXTrainer:
             except Exception:
                 pass
             self._text_shape_guard_preflight = None
+            # Close this run's generation: a stop still latched from it is now
+            # stale, while any later request belongs to the next run.
+            self._run_generation = getattr(self, "_run_generation", 0) + 1
 
     def _train_inner(self):
         """Inner training loop, separated for GC cleanup in finally block."""
@@ -2959,6 +4168,9 @@ class MLXTrainer:
                 is_vlm=is_vlm,
                 distributed_world_size=distributed_world_size,
                 compile_policy=compile_policy,
+                includes_epochs=getattr(
+                    self, "_prepared_batches_include_epochs", False,
+                ),
             )
         # Shared by the preflight and prepared paths: batch_iter is the
         # streaming producer when active, None otherwise.
@@ -2968,6 +4180,60 @@ class MLXTrainer:
         )
         self._active_batch_iter = batch_iter
         grad_accum = args.gradient_accumulation_steps
+        # Conceptual total micro-batches for an epoch-count-driven run, used to
+        # shrink the optimizer-step budget when a should_epoch_stop callback skips
+        # an epoch's tail (see _honor_epoch_stop_skip below). None for max_steps
+        # runs (fixed budget) and single-pass runs (no epoch cycling). On the
+        # default batching path `batches` holds ONE dataset pass revisited
+        # num_train_epochs times, so the conceptual total is
+        # len(batches) * num_train_epochs; on the torch_randperm path
+        # (_prepared_batches_include_epochs) `batches` already holds every epoch.
+        # The count is ceiled, matching HF's outer loop over
+        # range(ceil(num_train_epochs)). Truncating made a fractional run forfeit
+        # its tail epoch: 1.5 epochs stopped in epoch 1 saw a one-pass horizon, so
+        # the budget went to zero at the stop. That tail epoch stays bounded by the
+        # pre-skip budget via the clamp in _honor_epoch_stop_skip, and whole counts
+        # are unchanged (ceil(E) == int(E)).
+        _epoch_stop_total_microbatches = None
+        if args.max_steps <= 0 and batches is not None:
+            _n_batches = len(batches)
+            if getattr(self, "_prepared_batches_include_epochs", False):
+                _epoch_stop_total_microbatches = _n_batches
+            elif args.num_train_epochs > 0:
+                _epoch_stop_total_microbatches = (
+                    _n_batches * math.ceil(float(args.num_train_epochs))
+                )
+        elif (
+            args.max_steps <= 0
+            and batch_iter is not None
+            and args.num_train_epochs > 0
+        ):
+            # Declared-length streaming epochs: _prepare_data resolved the source
+            # length into _streaming_epoch_batch_count, so the horizon is that
+            # per-pass count times the ceiled epoch count, as on the materialized
+            # path. Without it a skipped epoch tail kept the full budget and the run
+            # made it up out of the next pass, overtraining past num_train_epochs.
+            # An unsized stream leaves the count 0 and stays None.
+            _stream_epoch_batches = int(
+                getattr(self, "_streaming_epoch_batch_count", 0) or 0
+            )
+            if _stream_epoch_batches > 0:
+                _epoch_stop_total_microbatches = (
+                    _stream_epoch_batches
+                    * math.ceil(float(args.num_train_epochs))
+                )
+        # Micro-batches in one epoch, where the epoch's last micro-batch forces an
+        # optimizer step (HF's do_sync_step). Set for epoch-count runs and for
+        # max_steps runs whose plan reports an exact one-pass length; None for
+        # streaming and for max_steps runs left on the dataset-size
+        # approximation, which keep the flat model.
+        _epoch_flush_microbatches = _mlx_epoch_microbatches(
+            args,
+            batches,
+            includes_epochs=getattr(
+                self, "_prepared_batches_include_epochs", False,
+            ),
+        )
         self._compile_shape_guard_report = _compile_shape_guard_report
 
         # Build optimizer with LR schedule
@@ -3017,9 +4283,46 @@ class MLXTrainer:
                 # loop overwrites this on every optimizer step of a real resume.
                 self._global_step = _resume_step
                 self._train_loss_history = list(ts.get("train_loss_history", []))
+                # Restore the totals so a resumed run still spans both halves.
+                # Older checkpoints carry the history but no weights: fall back to
+                # the legacy mean rather than report only post-resume windows.
+                if "train_loss_token_total" in ts:
+                    self._train_loss_token_sum = float(
+                        ts.get("train_loss_token_sum", 0.0) or 0.0
+                    )
+                    self._train_loss_token_total = int(
+                        ts.get("train_loss_token_total", 0) or 0
+                    )
+                elif self._train_loss_history:
+                    self._train_loss_weighting_ok = False
                 self._best_metric = ts.get("best_metric", None)
                 self._best_step = ts.get("best_step", None)
                 self._es_patience_counter = int(ts.get("es_patience_counter", 0) or 0)
+                # Restore the callback-visible input-token counter so a
+                # token-budget stopping callback resumes from the accumulated
+                # count rather than 0. .get default keeps pre-fix checkpoints
+                # (no num_input_tokens_seen key) resumable.
+                self._resume_num_input_tokens_seen = int(
+                    ts.get("num_input_tokens_seen", 0) or 0
+                )
+                # Restore the callback-visible epoch so on_train_begin reports the
+                # checkpoint's progress instead of None. Without it a no-op resume
+                # (checkpoint already at max_steps, loop body never runs) leaves it
+                # None through on_train_end, where HF's NotebookProgressCallback
+                # does int(state.epoch). .get keeps pre-fix checkpoints resumable.
+                _ckpt_epoch = ts.get("epoch", None)
+                self._resume_epoch = (
+                    None if _ckpt_epoch is None else float(_ckpt_epoch)
+                )
+                # Stash the checkpoint's ExportableState callback state; it is
+                # applied after _init_callback_state, which rebuilds self.state.
+                # The .get default keeps pre-fix checkpoints resumable.
+                self._resume_stateful_callbacks = ts.get(
+                    "stateful_callbacks", None
+                ) or {}
+                # Same for the callback-visible log history, which seeds
+                # state.log_history. .get keeps pre-fix checkpoints resumable.
+                self._resume_log_history = list(ts.get("log_history", None) or [])
                 # best/ lives in output_dir, not in the checkpoint dir, so a
                 # checkpoint resumed elsewhere (copied dir, new output_dir) can
                 # carry best-model state whose weights aren't present. Keep the
@@ -3027,7 +4330,10 @@ class MLXTrainer:
                 # best-saves and early-stop against a model that
                 # load_best_model_at_end can't restore.
                 _best_path = f"{args.output_dir}/best/adapters.safetensors"
-                if self._best_step is not None and not os.path.exists(_best_path):
+                _best_weights_missing = (
+                    self._best_step is not None and not os.path.exists(_best_path)
+                )
+                if _best_weights_missing:
                     _main_print(
                         f"Unsloth: checkpoint carries best-model state (step "
                         f"{self._best_step}) but {args.output_dir}/best has no "
@@ -3036,6 +4342,18 @@ class MLXTrainer:
                     self._best_metric = None
                     self._best_step = None
                     self._es_patience_counter = 0
+                # TrainerState.best_metric can be live while "best_metric" above
+                # is null, so restore it from its own key, else
+                # EarlyStoppingCallback calls the first post-resume eval a new
+                # best. The restart above clears it too: HF keeps ONE watermark
+                # for callbacks and best selection. Read after that branch so
+                # pre-fix checkpoints keep the native fallback.
+                self._resume_callback_best_metric = None if _best_weights_missing else ts.get(
+                    "callback_best_metric", self._best_metric,
+                )
+                self._resume_callback_best_step = None if _best_weights_missing else ts.get(
+                    "callback_best_step", self._best_step,
+                )
                 _main_print(
                     f"Unsloth: Resuming from {_resume_from} "
                     f"(step={_resume_step}, loss_history={len(self._train_loss_history)} entries)."
@@ -3046,6 +4364,17 @@ class MLXTrainer:
                     f"resume state files are missing ({e}). Refusing to "
                     f"silently restart from step 0."
                 ) from e
+
+        self.callback_handler.optimizer = optimizer
+        self.callback_handler.lr_scheduler = getattr(self, "_lr_schedule", None)
+        self.callback_handler.processing_class = self.processor or self.tokenizer
+        self._ensure_callback_args_compat()
+        self._init_callback_state(total_steps, _resume_step, batches)
+        # _init_callback_state rebuilds self.state, so seed the callback-visible
+        # stateful_callbacks after it.
+        self._restore_callback_states(
+            getattr(self, "_resume_stateful_callbacks", None) or {}
+        )
 
         # Build loss+grad function — returns ((loss, ntoks), grads)
         loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
@@ -3545,7 +4874,18 @@ class MLXTrainer:
         eval_batches = None
         text_completion_only_loss = _text_completion_only_loss_arg(args)
         text_assistant_only_loss = _text_assistant_only_loss_arg(args)
-        if args.eval_steps > 0 and self.eval_dataset is not None:
+
+        def _prepare_eval_batches():
+            """Materialize eval batches the first time evaluation is requested.
+
+            Deferred so a callback can request evaluation even when the static
+            eval cadence is off. Every rank enters this together (the eval
+            control flag is rank-synced), so the collective create_batches call
+            stays in lockstep.
+            """
+            nonlocal eval_batches
+            if eval_batches is not None or self.eval_dataset is None:
+                return eval_batches
             eval_batch_size = (
                 getattr(args, "per_device_eval_batch_size", None)
                 or args.per_device_train_batch_size
@@ -3596,7 +4936,9 @@ class MLXTrainer:
                     }
                 else:
                     eval_batches = _create_eval_batches(self.eval_dataset)
-            if eval_batches:
+            self.callback_handler.eval_dataloader = eval_batches
+            _eval_steps = int(getattr(self.state, "eval_steps", 0) or 0)
+            if eval_batches and _eval_steps > 0:
                 lazy_eval = isinstance(eval_batches, _MLXLazyEvalBatchView) or (
                     isinstance(eval_batches, dict)
                     and any(
@@ -3605,8 +4947,9 @@ class MLXTrainer:
                     )
                 )
                 if lazy_eval:
+                    # A lazy view has no length to report.
                     _main_print(
-                        f"Unsloth: Eval enabled every {args.eval_steps} steps "
+                        f"Unsloth: Eval enabled every {_eval_steps} steps "
                         "(lazy text batches)."
                     )
                 else:
@@ -3615,9 +4958,80 @@ class MLXTrainer:
                         if isinstance(eval_batches, dict) else len(eval_batches)
                     )
                     _main_print(
-                        f"Unsloth: Eval enabled every {args.eval_steps} steps "
+                        f"Unsloth: Eval enabled every {_eval_steps} steps "
                         f"({eval_batch_count} eval batches)."
                     )
+            return eval_batches
+
+        def _fire(event, **kwargs):
+            """Dispatch an HF callback event on every rank, like HF Trainer.
+
+            HF invokes callbacks per process and expects host I/O to self-gate
+            on state.is_world_process_zero (seeded per rank in
+            _init_callback_state, same as on_init_end). Dispatching on rank 0
+            alone leaves the peers' process-local training state un-mutated: an
+            on_pre_optimizer_step callback overriding optimizer.learning_rate
+            would update rank 0 only, so the peers apply the same all-reduced
+            gradient with a different LR and the replicas silently diverge.
+            Control-flag divergence is reconciled by the caller (_sync_stop for
+            the stop flag, _distributed_sync_control_actions for log/eval/save).
+
+            A callback that raises on one rank must not unwind that rank alone:
+            the peers would return here and hang at the next collective. Route
+            the failure through the distributed consensus path (all ranks call
+            _fire in lockstep) so every rank aborts with the original error
+            surfaced. Single-process keeps re-raising the original exception
+            unchanged.
+
+            Interrupts (KeyboardInterrupt/SystemExit and any other
+            BaseException) are captured for the same reason the evaluation,
+            batch-fetch and checkpoint paths capture them: a rank-local Ctrl-C
+            delivered while a rank is inside a callback -- ordinary with a
+            stock host-I/O callback that self-gates on is_world_process_zero,
+            so only one rank spends time in it -- would otherwise skip the
+            consensus below and strand the peers inside it with no timeout and
+            no way to signal them out. _raise_distributed_failure_from_any
+            re-raises a non-Exception unwrapped and without mutating trainer
+            state, so the interrupted rank still exits with the original
+            interrupt.
+            """
+            call_error = None
+            try:
+                self.control = self.callback_handler.call_event(
+                    event, args, self.state, self.control, **kwargs,
+                )
+            except BaseException as e:
+                call_error = e
+            if distributed_world_size > 1:
+                self._raise_distributed_failure(
+                    call_error is not None,
+                    f"{event} callback",
+                    call_error,
+                )
+            elif call_error is not None:
+                raise call_error
+
+        def _sync_stop():
+            """Propagate a callback stop request to every rank in lockstep.
+
+            _sync_callback_stop copies control.should_training_stop into
+            stop_requested on rank 0; _distributed_should_stop all-reduces the
+            OR of stop_requested so no rank is left spinning while rank 0 exits.
+            """
+            self._sync_callback_stop()
+            return self._distributed_should_stop()
+
+        def _sync_epoch_stop():
+            """OR-reduce control.should_epoch_stop across ranks (the epoch-scoped
+            analogue of _sync_stop). Every rank sees the same result, so when the
+            honoring below skips the rest of the epoch each rank skips the same
+            micro-batches and DDP stays in lockstep."""
+            return self._distributed_any_flag(self.control.should_epoch_stop)
+
+        self.callback_handler.train_dataloader = batches if batches is not None else batch_iter
+        self.control.should_training_stop = False
+        _fire("on_train_begin")
+        _sync_stop()
 
         features = []
         if is_vlm:
@@ -3659,24 +5073,567 @@ class MLXTrainer:
 
         # Training loop — mlx-lm pattern
         model.train()
+        # HF's include_num_input_tokens_seen gate: "no"/False (its default, and the
+        # one _ensure_callback_args_compat applies) skips input-token counting
+        # entirely. The remaining values select the counting MODE ("non_padding"
+        # vs "all"/True). Read once so the branch is identical on every rank.
+        input_token_mode = getattr(args, "include_num_input_tokens_seen", False)
+        track_input_tokens = input_token_mode not in ("no", False)
+        # HF reads the pad id off self.processing_class for the "non_padding"
+        # fallback; this trainer's processing class is processor-or-tokenizer.
+        input_token_pad_id = getattr(
+            self.processor or self.tokenizer, "pad_token_id", None,
+        ) if track_input_tokens else None
         start_time = time.perf_counter()
+        # Metric accumulators are split into a "committed" window (loss/tokens
+        # from optimizer steps that have already been APPLIED to the model but not
+        # yet logged) and a "pending" window (the micro-batches of the current
+        # accumulation window, which have NOT yet updated the model). HF only ever
+        # folds a completed optimizer step's loss into the logged tr_loss and never
+        # logs a not-yet-applied partial window (_maybe_log_save_evaluate logs only
+        # when state.global_step > _globalstep_last_logged, and its last epoch batch
+        # is force-applied as an optimizer step). Mirroring that split keeps a forced
+        # log (epoch-end / callback) and the post-loop flush emitting only committed
+        # metrics, while an abandoned partial window drops only its pending part.
         losses = 0
         n_tokens = 0
         steps = 0
+        pending_losses = 0
+        pending_n_tokens = 0
+        pending_steps = 0
         trained_tokens = 0
         train_time = 0
+        # Wall clock for the PENDING window, split like the loss/token counters
+        # above: charging a forced log the pending micro-batches' time would
+        # understate its tokens/s and hide that time from the window that owns it.
+        pending_time = 0
         grad_accum_state = None
+        accum_progress = 0
+        batches_per_epoch = self._callback_batches_per_epoch(batches)
+        # A streaming source materializes no `batches`, so the helper above returns
+        # None -- but a supported streaming num_train_epochs run DOES have a known
+        # epoch length: _prepare_data resolved the declared source length into
+        # _streaming_epoch_batch_count (the same count total_steps is derived from)
+        # and rejected any source whose per-pass micro-batches are not divisible by
+        # grad_accum, so every boundary lands on an optimizer step. HF dispatches
+        # epoch events and advances state.epoch off exactly this quantity whenever
+        # the dataloader reports a length -- steps_in_epoch = len(epoch_dataloader)
+        # (transformers trainer.py), true for an IterableDataset with __len__ -- so
+        # gate the epoch lifecycle on it here too. Without this the run kept
+        # batches_per_epoch = None: on_epoch_begin/on_epoch_end never fired and
+        # state.epoch stayed None for the whole run.
+        if batches is None and batch_iter is not None and not batches_per_epoch:
+            batches_per_epoch = int(
+                getattr(self, "_streaming_epoch_batch_count", 0) or 0
+            ) or None
+        # A streaming run with NO known length has no dataset boundaries, so
+        # batches_per_epoch stays None -- but HF still runs ONE conceptual epoch
+        # over a synthetic horizon: steps_in_epoch = max_steps * grad_accum for a
+        # length-less dataloader, and num_train_epochs = sys.maxsize only means
+        # "re-iterate as needed", so its `for epoch in range(...)` body runs
+        # exactly once and fires one on_epoch_begin / on_epoch_end around it
+        # (transformers _inner_training_loop; measured identical on 4.x and 5.x).
+        # state.epoch needs the same quantity anyway, since WandbCallback.on_save
+        # does round(state.epoch, 2) and raises TypeError on None.
+        stream_epoch_microbatches = None
+        if not batches_per_epoch and batch_iter is not None:
+            _stream_max_steps = int(getattr(args, "max_steps", 0) or 0)
+            if _stream_max_steps > 0:
+                stream_epoch_microbatches = _stream_max_steps * grad_accum
+        # Length in micro-batches of the epoch the CALLBACK lifecycle uses, which
+        # is the real dataset pass when there is one and HF's synthetic horizon
+        # otherwise. Kept as a separate name from batches_per_epoch on purpose:
+        # honoring control.should_epoch_stop skips to the next boundary, and for
+        # a length-less stream that means draining micro-batches out of a
+        # producer that cannot replay them (HF restarts its iterator instead), so
+        # _honor_epoch_stop_skip and its two gates stay on batches_per_epoch.
+        # Equal to batches_per_epoch whenever that is set, so every materialized
+        # and declared-length run is unaffected.
+        epoch_event_microbatches = batches_per_epoch or stream_epoch_microbatches
+
+        def _run_callback_epoch_begin(epoch_value):
+            """Dispatch one epoch-begin event at a dataset boundary (rank 0)."""
+            self.state.epoch = epoch_value
+            # HF resets should_epoch_stop at on_epoch_begin so a per-epoch stop
+            # from a prior epoch does not leak into this one.
+            self.control.should_epoch_stop = False
+            _fire("on_epoch_begin")
+            _sync_stop()
+
+        def _maybe_callback_epoch_begin(microstep):
+            """Dispatch epoch-begin at finite dataset boundaries."""
+            if (not epoch_event_microbatches
+                    or (microstep - 1) % epoch_event_microbatches != 0):
+                return False
+            _run_callback_epoch_begin(
+                (microstep - 1) / epoch_event_microbatches
+            )
+            return True
+
+        def _maybe_callback_epoch_end(microstep, current_step, grad_norm):
+            """Dispatch epoch-end after an optimizer step at a dataset boundary."""
+            if (not epoch_event_microbatches
+                    or microstep % epoch_event_microbatches != 0):
+                return
+            self.state.epoch = microstep / epoch_event_microbatches
+            # The loop's own "epoch" strategy cadence, raised where HF's flow
+            # raises it and folded into the same control flags, so it is a no-op
+            # when a DefaultFlowCallback is installed to raise it too.
+            self._request_epoch_cadence_actions()
+            _fire("on_epoch_end")
+            # A rank-dependent on_epoch_end callback can request log/eval/save on
+            # a subset; sync before the collective actions so peers stay in lockstep.
+            self._distributed_sync_control_actions()
+            if self.control.should_log or self.control.should_evaluate or self.control.should_save:
+                _run_callback_control_actions(current_step, grad_norm)
+            _sync_stop()
+
+        def _run_training_log(current_step, grad_norm):
+            """Emit one MLX/HF training log from accumulated loss counters.
+
+            The loss/token totals are all-reduced so every rank logs the same
+            global figures. Printing and the native step callbacks run on rank 0;
+            on_log fires on every rank and self-gates on is_world_process_zero.
+            """
+            nonlocal losses, n_tokens, steps, train_time, trained_tokens
+            # Nothing accumulated since the last log: an on_epoch_end (or other)
+            # callback can force should_log again on a step that already logged
+            # (e.g. logging_steps=1 at a dataset boundary), and the accumulators are
+            # plain-int 0 after a reset, so _distributed_all_sum returns an int and
+            # metric_tokens.item() below would raise (single process) / a real log
+            # would divide by zero. Skip like HF, which guards its log on
+            # state.global_step > self._globalstep_last_logged. steps advances
+            # identically on every rank, so this early-return stays in lockstep
+            # (no rank reaches the collective all-sum without the others).
+            if steps == 0:
+                self.control.should_log = False
+                return
+            metric_losses = self._distributed_all_sum(losses, stream=mx.cpu)
+            metric_tokens = self._distributed_all_sum(n_tokens, stream=mx.cpu)
+            mx.eval(metric_losses, metric_tokens)
+            train_loss = (
+                (metric_losses / metric_tokens).item()
+                if metric_tokens.item() > 0 else 0.0
+            )
+            local_tok_count = int(n_tokens.item())
+            tok_count = int(metric_tokens.item())
+            trained_tokens += tok_count
+            lr_val = optimizer.learning_rate.item()
+            tokens_sec = tok_count / train_time if train_time > 0 else 0
+            peak_mem = mx.get_peak_memory() / 1e9
+
+            self._train_loss_history.append(train_loss)
+            # metric_losses is already sum(loss * tokens) over the window, so these
+            # totals give the exact global mean whatever the boundaries were.
+            self._train_loss_token_sum += float(metric_losses.item())
+            self._train_loss_token_total += tok_count
+            grad_norm_val = (
+                float(grad_norm.item())
+                if grad_norm is not None else None
+            )
+            if grad_norm_val is not None:
+                self._grad_norm_history.append(grad_norm_val)
+            self._tokens_per_second_history.append(tokens_sec)
+            self._peak_memory_history.append(peak_mem)
+            self._step_times.append(train_time / steps if steps > 0 else 0)
+            self._local_token_count_history.append(local_tok_count)
+            self._global_token_count_history.append(tok_count)
+
+            reset_after = getattr(self, '_benchmark_reset_peak_after_step', 0)
+            if reset_after > 0 and current_step == reset_after:
+                mx.synchronize()
+                mx.reset_peak_memory()
+
+            elapsed_total = time.perf_counter() - start_time
+            grad_text = (
+                f"Grad: {grad_norm_val:.4f} | "
+                if grad_norm_val is not None else ""
+            )
+            _main_print(
+                f"  Step {current_step}/{total_steps} | "
+                f"Loss: {train_loss:.4f} | "
+                f"{grad_text}"
+                f"LR: {lr_val:.2e} | "
+                f"Tok/s: {tokens_sec:.0f} | "
+                f"Peak: {peak_mem:.2f} GB"
+            )
+
+            if is_main_process:
+                for cb in self._step_callbacks:
+                    try:
+                        cb(
+                            current_step, total_steps, train_loss, lr_val,
+                            tokens_sec, peak_mem, elapsed_total, trained_tokens,
+                            grad_norm_val,
+                        )
+                    except Exception as e:
+                        _main_print(f"Unsloth: step callback error: {e}")
+
+            logs = {
+                "loss": train_loss,
+                "learning_rate": lr_val,
+                "tokens_per_second": tokens_sec,
+                "peak_memory_gb": peak_mem,
+                "trained_tokens": trained_tokens,
+            }
+            if grad_norm_val is not None:
+                logs["grad_norm"] = grad_norm_val
+            # HF's Trainer.log stamps the epoch onto every payload, so a persisted
+            # log_history entry keeps it after state.epoch has moved on.
+            if self.state.epoch is not None:
+                logs["epoch"] = self.state.epoch
+            self.control.should_log = False
+            # Every rank appends, like HF Trainer.log: on_log now fires on all
+            # ranks, so a peer callback must see the entry it is notified about.
+            record = dict(logs)
+            record["step"] = self.state.global_step
+            self.state.log_history.append(record)
+            _fire("on_log", logs=logs)
+            # on_log may itself request an eval or save (HF checks
+            # should_evaluate/should_save after logging in the same step). Sync now:
+            # the caller's should_eval / should_save branches run collective eval +
+            # rank-0-guarded saves, so a request raised on a subset of ranks would
+            # make those ranks enter _run_eval/_run_checkpoint while the rest skip
+            # them and hang at the collective. No-op at world 1.
+            self._distributed_sync_control_actions()
+
+            losses = 0
+            n_tokens = 0
+            steps = 0
+            train_time = 0
+
+        def _run_eval(current_step):
+            """Run eval and dispatch MLX/HF eval callbacks in DDP lockstep."""
+            current_eval_batches = _prepare_eval_batches()
+            if not current_eval_batches:
+                self.control.should_evaluate = False
+                return False
+            # Pause the training prefetch producer for the eval: it shares the
+            # tokenizer/processor this eval pass re-enters.
+            _pf = (
+                self._mlx_prefetch_control.get("prefetcher")
+                if getattr(self, "_mlx_prefetch_control", None) else None
+            )
+            if _pf is not None:
+                _pf.quiesce()
+            _metrics_before_eval = self._last_eval_metrics
+            try:
+                val_loss, ppl = self._evaluate(
+                    current_eval_batches, loss_fn, is_vlm=is_vlm)
+            finally:
+                if _pf is not None:
+                    _pf.resume()
+            model.train()
+            # An external cancel (the public stop_requested property, e.g. a UI
+            # cancel button) makes _evaluate_batch_totals skip every remaining
+            # batch, so these totals describe an evaluation that never fully ran
+            # -- zero batches gives eval_loss 0.0. Dispatching that hands
+            # callbacks a phantom result: EarlyStoppingCallback reads it as an
+            # improvement and resets its patience counter, the best watermark
+            # latches a value no real evaluation can beat, and _run_checkpoint
+            # persists both. Drop it and restore the last real metrics instead.
+            # A CALLBACK stop cannot reach here: it is deliberately left in
+            # control.should_training_stop until after this step's actions (see
+            # below), so it still gets its real evaluation.
+            # OR-reduced so every rank takes this branch together: a cancel that
+            # lands on one rank after _evaluate's last eval-status collective
+            # would otherwise return here alone and strand its peers in _fire.
+            if self._distributed_should_stop():
+                self._last_eval_metrics = _metrics_before_eval
+                self.control.should_evaluate = False
+                return False
+            _main_print(
+                f"  Eval  {current_step}/{total_steps} | "
+                f"Val Loss: {val_loss:.4f} | "
+                f"Perplexity: {ppl:.2f}"
+            )
+            if is_main_process:
+                for cb in self._eval_callbacks:
+                    try:
+                        cb(current_step, val_loss, ppl)
+                    except Exception as e:
+                        _main_print(f"Unsloth: eval callback error: {e}")
+
+            metrics = self._last_eval_metrics or {}
+            # Same epoch stamp. Rebound rather than mutated so the checkpoint's
+            # eval_metrics payload stays exactly as evaluated.
+            if self.state.epoch is not None:
+                metrics = {**metrics, "epoch": self.state.epoch}
+            record = dict(metrics)
+            record["step"] = self.state.global_step
+            self.state.log_history.append(record)
+            _fire("on_log", logs=dict(metrics))
+            # Clear AFTER the eval on_log and just before on_evaluate, where HF
+            # clears it. Clearing earlier lets an on_log callback's fresh
+            # should_evaluate=True survive, so a boundary step evaluates twice.
+            self.control.should_evaluate = False
+            _fire("on_evaluate", metrics=metrics)
+            # on_log/on_evaluate may each request a log/eval/save (HF checks
+            # should_save after on_evaluate in the same step). Sync those flags
+            # before the caller reads should_log / should_save: those branches run
+            # collective code (metric all-reduce, rank-0-guarded checkpoint save +
+            # on_save), so a request raised on a subset of ranks would make those
+            # ranks enter _run_training_log/_run_checkpoint while the rest skip them
+            # and hang at the collective. Mirrors the on_log sync in
+            # _run_training_log; no-op at world size 1.
+            self._distributed_sync_control_actions()
+            improved = self._update_callback_best_metric(metrics)
+            # save_strategy="best" (SaveStrategy.BEST): DefaultFlowCallback never
+            # raises this one -- its on_step_end/on_epoch_end act on STEPS and
+            # EPOCH only -- so HF's Trainer core decides it here, right after the
+            # evaluation, and it ASSIGNS rather than ORs: `self.control.should_save
+            # = is_new_best_metric` (transformers _maybe_log_save_evaluate,
+            # identical in 4.x and 5.x). The assignment matters -- an evaluation
+            # that did not improve also CLEARS a save some other source requested
+            # for this same step, which is how "best" writes only improving
+            # checkpoints. Gating the static cadence on the strategy would
+            # otherwise leave "best" with no cadence at all, the same hole the
+            # epoch cadence fills for "epoch". Rank-consistent: metrics are
+            # already all-reduced and state.best_metric advances identically on
+            # every rank, so this needs no collective and cannot undo the sync
+            # above on a subset.
+            if self._best_save_strategy_enabled():
+                self.control.should_save = improved
+            # An external cancel arriving before/during eval is OR-reduced here so
+            # every rank agrees on stop_requested before the divergent best-model /
+            # early-stopping branch in _run_best_tracking (its rank-0-guarded best
+            # save would otherwise hang peers). A callback stop requested during
+            # on_step_end / on_evaluate is deliberately NOT copied into
+            # stop_requested yet: HF (_maybe_log_save_evaluate) runs
+            # _determine_best_metric and writes the checkpoint for this step BEFORE
+            # the loop honors should_training_stop, so latching the callback stop
+            # here would make _run_best_tracking (gated on not stop_requested) skip
+            # a valid, improving eval, leaving load_best_model_at_end to restore a
+            # stale model. The callback stop is applied by the caller's tail
+            # _sync_stop(), after best tracking and the same-step save. No-op at
+            # world size 1.
+            self._distributed_should_stop()
+            return True
+
+        def _run_best_tracking(current_step):
+            """Update native best-model + early-stopping state in DDP lockstep."""
+            _track = not self.stop_requested and (
+                getattr(args, "load_best_model_at_end", False)
+                or int(getattr(args, "early_stopping_patience", 0) or 0) > 0
+            )
+            if not _track:
+                return
+            _metric_name = self._resolved_best_metric_name()
+            _em = self._last_eval_metrics or {}
+            if _metric_name not in _em:
+                raise ValueError(
+                    f"metric_for_best_model={_metric_name!r} not in eval "
+                    f"metrics; available: {sorted(_em)}"
+                )
+            _cur = _em[_metric_name]
+            _greater = bool(getattr(args, "greater_is_better", False))
+            _improved = (
+                _cur == _cur  # reject NaN: a diverged eval must never be "best"
+                and (
+                    self._best_metric is None
+                    or (_cur > self._best_metric if _greater else _cur < self._best_metric)
+                )
+            )
+            if _improved:
+                self._best_metric = _cur
+                self._best_step = current_step
+                self.state.best_metric = _cur
+                self.state.best_global_step = current_step
+                self.state.best_model_checkpoint = f"{args.output_dir}/best"
+                self._es_patience_counter = 0
+                # Bookkeeping runs on every rank to keep early-stopping in
+                # lockstep; only rank 0 writes output_dir/best. Sync save
+                # failures so a rank-0 error does not hang peers at the next
+                # collective.
+                best_save_error = None
+                if is_main_process:
+                    try:
+                        save_trainable_adapters(model, f"{args.output_dir}/best")
+                    except ValueError as e:
+                        _main_print(f"  Unsloth: skipped best-model save ({e})")
+                    except BaseException as e:
+                        best_save_error = e
+                self._raise_distributed_failure(
+                    best_save_error is not None,
+                    "best-model save",
+                    best_save_error,
+                )
+            else:
+                self._es_patience_counter += 1
+                _pat = int(getattr(args, "early_stopping_patience", 0) or 0)
+                if _pat > 0 and self._es_patience_counter >= _pat:
+                    _main_print(
+                        f"Unsloth: early stopping at step {current_step} "
+                        f"(no {_metric_name} improvement in {_pat} evals)."
+                    )
+                    self._early_stopped = True
+
+        def _run_checkpoint(current_step):
+            """Save a step checkpoint (rank 0) and dispatch HF on_save."""
+            # Fold the committed-but-unlogged window into the totals WRITTEN to
+            # the checkpoint: losses/n_tokens hold applied optimizer steps that no
+            # log has folded into self._train_loss_token_* yet, so a save cadence
+            # out of phase with the log cadence would persist totals covering
+            # fewer steps than the checkpoint's own global_step. Only the payload
+            # is adjusted, so the later _run_training_log does not double count.
+            # The all-sum runs on EVERY rank before the rank-0 write guard to stay
+            # in lockstep, and is skipped at steps == 0 where the accumulators are
+            # plain ints with no .item(). The pending window is excluded.
+            ckpt_loss_sum = float(self._train_loss_token_sum)
+            ckpt_loss_total = int(self._train_loss_token_total)
+            ckpt_committed_steps = steps
+            if ckpt_committed_steps > 0:
+                _ckpt_losses = self._distributed_all_sum(losses, stream=mx.cpu)
+                _ckpt_tokens = self._distributed_all_sum(n_tokens, stream=mx.cpu)
+                mx.eval(_ckpt_losses, _ckpt_tokens)
+                ckpt_loss_sum += float(_ckpt_losses.item())
+                ckpt_loss_total += int(_ckpt_tokens.item())
+            checkpoint_error = None
+            checkpoint_written = False
+            # Declared here too: the on_save guard below reads it on every rank,
+            # and only rank 0 enters the write block that assigns it.
+            checkpoint_complete = False
+            if is_main_process:
+                ckpt_dir = f"{args.output_dir}/checkpoint-{current_step}"
+                try:
+                    try:
+                        save_trainable_adapters(model, ckpt_dir)
+                    except ValueError as e:
+                        _main_print(f"  Unsloth: skipped checkpoint ({e})")
+                    else:
+                        checkpoint_written = True
+                        # Also write optimizer + trainer state so
+                        # resume_from_checkpoint restores Adam moments, step
+                        # counter, loss history, and best-model / early-stopping
+                        # tracking. Best-effort: the adapter save already
+                        # succeeded, so log failures but keep it.
+                        try:
+                            save_optimizer_state(optimizer, ckpt_dir)
+                            save_trainer_state(
+                                {
+                                    "global_step": current_step,
+                                    # HF checkpoints TrainerState wholesale, so
+                                    # epoch travels with global_step and a resumed
+                                    # run reports progress from on_train_begin.
+                                    # Same key name as trainer_state.json.
+                                    "epoch": self.state.epoch,
+                                    "train_loss_history": list(
+                                        self._train_loss_history
+                                    ),
+                                    "train_loss_token_sum": ckpt_loss_sum,
+                                    "train_loss_token_total": ckpt_loss_total,
+                                    "best_metric": self._best_metric,
+                                    "best_step": self._best_step,
+                                    "es_patience_counter": self._es_patience_counter,
+                                    # Persist the callback-visible input-token
+                                    # counter so a token-budget stopping callback
+                                    # does not restart at 0 on resume (HF saves
+                                    # num_input_tokens_seen in trainer_state.json).
+                                    "num_input_tokens_seen": int(
+                                        self.state.num_input_tokens_seen
+                                    ),
+                                    # HF's TrainerState watermark, persisted
+                                    # wholesale by _save_checkpoint. It advances
+                                    # on every eval, so it is non-null even when
+                                    # "best_metric"/"best_step" above are null.
+                                    "callback_best_metric": (
+                                        None if self.state.best_metric is None
+                                        else float(self.state.best_metric)
+                                    ),
+                                    "callback_best_step": (
+                                        None if self.state.best_global_step is None
+                                        else int(self.state.best_global_step)
+                                    ),
+                                    # HF writes this into every checkpoint;
+                                    # without it the field stays permanently
+                                    # empty and no later release can recover it.
+                                    "stateful_callbacks":
+                                        self._export_callback_states(),
+                                    # HF's trainer_state.json carries the full
+                                    # log_history; without it a resumed run
+                                    # loses every pre-resume entry.
+                                    "log_history": list(self.state.log_history),
+                                },
+                                ckpt_dir,
+                            )
+                            checkpoint_complete = True
+                        except Exception as e:
+                            _main_print(
+                                "  Unsloth: checkpoint saved without "
+                                f"resume state ({e})"
+                            )
+                        _main_print(f"  Saved checkpoint to {ckpt_dir}")
+                        if checkpoint_complete:
+                            _prune_stale_checkpoints(
+                                args.output_dir,
+                                args.save_total_limit,
+                            )
+                except BaseException as e:
+                    checkpoint_error = e
+            self._raise_distributed_failure(
+                checkpoint_error is not None,
+                "checkpoint save",
+                checkpoint_error,
+            )
+            self.control.should_save = False
+            # HF fires callback_handler.on_save only after _save_checkpoint writes
+            # to disk. save_trainable_adapters raises ValueError for a fully frozen
+            # / no-adapter model, skipping the write; firing on_save anyway would
+            # make integrations that react to it (hub uploaders, checkpoint
+            # trackers) record a checkpoint-N directory that was never created.
+            # checkpoint_complete is required for the same reason: when the
+            # optimizer/trainer-state write fails the adapters are on disk but
+            # the directory cannot be resumed from, and json.dump has already
+            # truncated trainer_state.json. HF never reaches on_save in that case
+            # (_save_checkpoint propagates the failure), so keep the best-effort
+            # partial directory but stop advertising it as a resume point --
+            # _prune_stale_checkpoints above is gated on the same fact.
+            # The write happens on rank 0 only, so broadcast the outcome (all-sum
+            # of a rank-0 flag; peers contribute 0) and fire on_save on every rank
+            # together, or the rank that skips it strands its peers at the _fire
+            # consensus collective. No-op at world size 1.
+            checkpoint_written_any = self._distributed_status_mask(
+                1 if (is_main_process and checkpoint_written and checkpoint_complete)
+                else 0
+            ) > 0
+            if checkpoint_written_any:
+                _fire("on_save")
+
+        def _run_callback_control_actions(current_step, grad_norm):
+            """Run log/eval/save actions requested by callback control flags.
+
+            Callers sync the control action flags across ranks before invoking
+            this so the collective log/eval/save paths run in lockstep.
+            """
+            if self.control.should_log:
+                _run_training_log(current_step, grad_norm)
+            if self.control.should_evaluate:
+                if _run_eval(current_step):
+                    _run_best_tracking(current_step)
+            if self.control.should_save:
+                _run_checkpoint(current_step)
+
         # When resuming, start batch_idx at the resume position so the visit
         # mapping (plan-provided for finite plans, modulo for eager lists)
-        # lands on the same batch the original run would have seen next.
-        batch_idx = _resume_step * grad_accum
+        # lands on the same batch the original run would have seen next. Once an
+        # epoch's tail forces a step, global_step no longer maps flatly onto
+        # micro-batches, so rebuild the cursor per epoch like HF does; otherwise
+        # the resume skips the next epoch's opening micro-batch and cycles into
+        # a pass num_train_epochs never authorised.
+        if _epoch_flush_microbatches:
+            _resume_microstep = _mlx_microstep_for_step(
+                _resume_step, _epoch_flush_microbatches, grad_accum,
+            )
+        else:
+            _resume_microstep = _resume_step * grad_accum
+        batch_idx = _resume_microstep
 
         # Streaming mode: fast-forward the iterator to the resume position.
         # The seed is the same and create_batches/iterate_*_batches is
         # deterministic, so consuming N batches gives us the same data
         # ordering the killed run would have produced.
         if _resume_step > 0 and batch_iter is not None and not _prefetch_active:
-            for _ in range(_resume_step * grad_accum):
+            for _ in range(_resume_microstep):
                 fast_forward_error = None
                 try:
                     next(batch_iter)
@@ -3774,11 +5731,141 @@ class MLXTrainer:
 
             return result
 
-        for it in range(_resume_step * grad_accum + 1, total_steps * grad_accum + 1):
+        def _honor_epoch_stop_skip(it_val, current_step, grad_norm):
+            """End the current epoch early for a should_epoch_stop callback.
+
+            Fires the truncated epoch's on_epoch_end plus any synced log/eval/save,
+            fast-forwards the batch cursor to the next epoch boundary, and shrinks
+            the optimizer-step budget so the loop does not cycle
+            batches[batch_idx % len(batches)] into extra data passes. Caller has
+            confirmed _sync_epoch_stop() and a mid-epoch position
+            (it_val % batches_per_epoch != 0). Returns the new `it` at the boundary.
+            All arithmetic is rank-consistent (it_val, batches_per_epoch, batch_idx
+            and _epoch_stop_total_microbatches are identical on every rank) and the
+            on_epoch_end path reuses the lockstep collectives, so DDP stays in step.
+            """
+            nonlocal batch_idx, total_steps
+            # Keep the callback-visible epoch FRACTIONAL for this truncated epoch's
+            # on_epoch_end, mirroring HF: state.epoch = epoch + (step+1)/steps_in_epoch
+            # is set at the last optimizer step and stays fractional when a callback
+            # breaks the epoch mid-way (transformers _inner_training_loop fires
+            # on_epoch_end without snapping state.epoch to the next integer). Snapping
+            # to ceil(it_val / batches_per_epoch) here would report a full epoch (e.g.
+            # 1.0) for a truncated one, making epoch-based integrations treat a
+            # partial epoch as completed. it_val / batches_per_epoch is the same
+            # fractional value the per-microstep update already set.
+            self.state.epoch = it_val / batches_per_epoch
+            # HF fires on_epoch_end for a should_epoch_stop-truncated epoch too,
+            # so its flow raises the epoch action here; raise ours on the same
+            # terms rather than skipping the boundary the callback just closed.
+            self._request_epoch_cadence_actions()
+            _fire("on_epoch_end")
+            self._distributed_sync_control_actions()
+            if (self.control.should_log or self.control.should_evaluate
+                    or self.control.should_save):
+                _run_callback_control_actions(current_step, grad_norm)
+            next_boundary = (
+                (it_val // batches_per_epoch) + 1
+            ) * batches_per_epoch
+            if batch_iter is None:
+                batch_idx += next_boundary - it_val
+            else:
+                # A streaming producer has no index to fast-forward, so discard
+                # the epoch's remaining micro-batches instead. The producer replays
+                # passes back to back, so this lands on the next pass's first batch,
+                # where HF lands too: it rebuilds the iterator every epoch and a
+                # should_epoch_stop break abandons the rest of the current one. Only
+                # declared-length streams reach here, so the count is finite, and it
+                # is rank-consistent, so DDP stays in lockstep; a producer failure
+                # takes the same consensus path as the loop's own fetch. batch_idx
+                # is unused when streaming, so park the cursor on it.
+                _drain_error = None
+                try:
+                    for _ in range(next_boundary - it_val):
+                        next(batch_iter)
+                except StopIteration:
+                    # Exhausted early: the loop's own fetch reports it.
+                    pass
+                except BaseException as _drain_exc:
+                    _drain_error = _drain_exc
+                if distributed_world_size > 1:
+                    self._raise_distributed_failure(
+                        _drain_error is not None,
+                        "skipping to the next streaming epoch boundary",
+                        _drain_error,
+                    )
+                elif _drain_error is not None:
+                    raise _drain_error
+                batch_idx = next_boundary
+            # An epoch-count-driven run (num_train_epochs, not max_steps) must
+            # shrink the budget after a skip, else the loop keeps cycling into
+            # extra passes and overtrains past num_train_epochs. Recompute from the
+            # micro-batches that remain (conceptual total minus the advanced
+            # cursor). Using _epoch_stop_total_microbatches covers BOTH epoch
+            # layouts: the default path where `batches` is one cycled pass
+            # (total = len(batches) * num_train_epochs) and the torch_randperm path
+            # where it is every epoch (total = len(batches)); the earlier
+            # flag-gated len(batches) form silently skipped the default path.
+            # max_steps runs keep their fixed budget (_epoch_stop_total_microbatches
+            # is None).
+            if _epoch_stop_total_microbatches is not None:
+                _remaining = _epoch_stop_total_microbatches - batch_idx
+                if _epoch_flush_microbatches:
+                    # batch_idx now sits on an epoch boundary, so what remains is
+                    # a whole number of epochs and each costs a ceil'd step
+                    # count; flooring the micro-batches shortens the epochs that
+                    # were never truncated.
+                    _shrunk = self._global_step + (
+                        (_remaining // _epoch_flush_microbatches)
+                        * _mlx_steps_per_epoch(
+                            _epoch_flush_microbatches, grad_accum,
+                        )
+                    )
+                else:
+                    _shrunk = self._global_step + _remaining // grad_accum
+                # Never grow the budget. The horizon counts every epoch HF would
+                # enter, but a fractional run's final epoch is cut short by the step
+                # budget itself, as HF stops such a run mid-epoch on
+                # should_training_stop. Whole counts never reach the clamp: each
+                # skipped epoch costs at most steps_per_epoch.
+                total_steps = min(total_steps, _shrunk)
+            return next_boundary
+
+        # DDP-lockstep microstep loop. global_step advances only on optimizer
+        # updates; _distributed_should_stop() OR-reduces stop_requested at the
+        # top so an early stop (external cancel or an HF stop callback that ran
+        # on a subset of ranks) drains every rank together before the next collective.
+        microstep = _resume_microstep
+        self._global_step = _resume_step
+        # Resuming mid-epoch re-enters an epoch whose boundary already passed, so
+        # the loop's predicate never fires its begin and a fresh callback sees an
+        # unpaired on_epoch_end. HF dispatches on_epoch_begin for the resumed
+        # partial epoch too, before skipping its trained batches. A stop set here
+        # is drained by the loop's first _distributed_should_stop().
+        if epoch_event_microbatches and microstep % epoch_event_microbatches:
+            _run_callback_epoch_begin(
+                float(microstep // epoch_event_microbatches)
+            )
+        while self._global_step < total_steps:
+            it = microstep + 1
             if self._distributed_should_stop() or self._early_stopped:
                 if self.stop_requested:
                     _main_print("Unsloth: Stop requested - ending training early.")
                 break
+
+            if _maybe_callback_epoch_begin(it):
+                if self.stop_requested:
+                    _main_print("Unsloth: Stop requested - ending training early.")
+                    break
+
+            if accum_progress == 0:
+                self.control.should_log = False
+                self.control.should_evaluate = False
+                self.control.should_save = False
+                _fire("on_step_begin")
+                if _sync_stop():
+                    _main_print("Unsloth: Stop requested - ending training early.")
+                    break
 
             tic = time.perf_counter()
 
@@ -3806,10 +5893,11 @@ class MLXTrainer:
                     ):
                         batch_data = batches.materialize(
                             scheduled_index,
-                            phase=phase_for_microstep(
+                            phase=_mlx_microstep_phase(
                                 _compile_scope,
                                 grad_accum,
                                 it - 1,
+                                _epoch_flush_microbatches,
                             ),
                         )
                     else:
@@ -3826,11 +5914,33 @@ class MLXTrainer:
             elif batch_error is not None:
                 raise batch_error
 
-            do_update = (it % grad_accum == 0)
+            do_update = (accum_progress + 1 >= grad_accum)
+            # HF forces a sync step on an epoch's last micro-batch, so the epoch
+            # is fully applied before on_epoch_end and its tail never mixes into
+            # the next epoch's window. It does this under max_steps too
+            # (do_sync_step reads len(dataloader), not the budget), but only an
+            # exact one-pass length qualifies; the dataset-size approximation
+            # leaves _epoch_flush_microbatches None and must not move steps.
+            if (
+                _epoch_flush_microbatches
+                and it % _epoch_flush_microbatches == 0
+            ):
+                do_update = True
             if do_update:
                 # Keep callable scheduler evaluation outside mx.compile. The
                 # compiled step reads the scalar LR already in optimizer state.
-                self._set_optimizer_lr_for_step(optimizer, it // grad_accum - 1)
+                self._set_optimizer_lr_for_step(optimizer, self._global_step)
+                # HF fires this between clipping and optimizer.step(). MLX fuses
+                # forward, backward, clipping and the update into step_fn, so the
+                # last point with the update un-applied is here, before step_fn.
+                # Nothing observable is lost: MLX parameters have no .grad and the
+                # gradient pytree is a local of the compiled function, so HF's
+                # "monitor gradients" use is unreachable in this backend, while an
+                # LR override still lands (the fused update reads optimizer.state
+                # after the dispatch). Like on_optimizer_step below, do NOT latch a
+                # callback stop here: OR-reduce an external cancel only.
+                _fire("on_pre_optimizer_step")
+                self._distributed_should_stop()
 
             if _ddp_update_outside_step:
                 lvalue, toks, grad_accum_state, grad_norm = _run_ddp_local_step(
@@ -3888,13 +5998,35 @@ class MLXTrainer:
                     else:
                         raise
 
-            losses += lvalue * toks
-            n_tokens += toks
-            steps += 1
+            # Accumulate into the PENDING window (this accumulation window's
+            # micro-batches). Fold into the COMMITTED window only once the
+            # optimizer step for the window has been applied (do_update), so a
+            # forced log or the post-loop flush never reports a not-yet-applied
+            # partial window, matching HF (a partial window is never logged and its
+            # loss is folded into tr_loss only after the optimizer step).
+            pending_losses += lvalue * toks
+            pending_n_tokens += toks
+            pending_steps += 1
+            if do_update:
+                # Window applied: fold pending into committed and reset pending.
+                # Evaluating the committed accumulators here materializes the folded
+                # pending contribution, so pending (now 0) needs no separate eval.
+                losses += pending_losses
+                n_tokens += pending_n_tokens
+                steps += pending_steps
+                pending_losses = 0
+                pending_n_tokens = 0
+                pending_steps = 0
+                _metric_eval = (losses, n_tokens)
+            else:
+                # Substep: only the pending window changed; committed is unchanged
+                # (already materialized at its last fold). Both are always arrays at
+                # this point, so mx.eval never sees a plain-int accumulator.
+                _metric_eval = (pending_losses, pending_n_tokens)
             # One evaluation boundary: the reported norm (when present) is
             # evaluated together with model/optimizer state and metric
             # accumulators, never as a separate earlier graph execution.
-            eval_targets = [state, losses, n_tokens]
+            eval_targets = [state, *_metric_eval]
             if grad_accum_state is not None:
                 eval_targets.append(grad_accum_state[0])
                 eval_targets.append(grad_accum_state[1])
@@ -3909,233 +6041,362 @@ class MLXTrainer:
                     "tokens after masking/truncation. Increase max_seq_length, "
                     "reduce image size, or check the chat template / labels."
                 )
-            train_time += time.perf_counter() - tic
+            # Global INPUT-token count for HF's num_input_tokens_seen, only when the
+            # run opted in (track_input_tokens). global_toks above is the loss mask's
+            # supervised-token count (used for the zero-token guard), not the
+            # input-token count HF's field reports, so counting it would undercount
+            # prompts and masked tokens. Sum the batch input positions the selected
+            # mode counts and all-reduce that (same global gather semantics as HF
+            # and as global_toks). The gate and the mode are rank-uniform config,
+            # so every rank skips or runs it together.
+            if track_input_tokens:
+                global_input_toks = self._distributed_all_sum(
+                    mx.array(
+                        _mlx_batch_input_token_count(
+                            batch_data,
+                            mode=input_token_mode,
+                            pad_token_id=input_token_pad_id,
+                        ), dtype=mx.int32,
+                    ),
+                    stream=mx.cpu,
+                )
+                mx.eval(global_input_toks)
+                # HF's TrainerState.num_input_tokens_seen is a global (all-rank
+                # gathered) count of INPUT tokens; callbacks that report or stop on a
+                # token budget read it directly. Use the all-reduced input-token
+                # count (not global_toks, which is the supervised/label-token count,
+                # nor the rank-local value which would undercount by ~world_size
+                # under DDP). Increment BEFORE on_optimizer_step: HF advances
+                # num_input_tokens_seen right after the forward, ahead of the
+                # on_optimizer_step callback (transformers trainer.py), so a
+                # token-budget callback observes this microbatch's tokens at the step
+                # it fires on.
+                self.state.num_input_tokens_seen += int(global_input_toks.item())
+            if do_update:
+                _fire("on_optimizer_step")
+                # Do NOT latch a callback should_training_stop into stop_requested
+                # here. HF fires on_optimizer_step, then on_step_end, then
+                # _maybe_log_save_evaluate (log+eval+save) for this step, and only
+                # breaks on should_training_stop AFTER that block (transformers
+                # trainer.py _inner_training_loop: on_optimizer_step -> on_step_end
+                # -> _maybe_log_save_evaluate -> the should_epoch_stop/
+                # should_training_stop break). Latching the stop now would make
+                # this step's _evaluate_batch_totals skip every eval batch (it is
+                # gated on not stop_requested), reporting 0.0 loss and corrupting
+                # best-model / early-stopping state. OR-reduce only an external
+                # cancel here; the callback stop is applied by the tail
+                # _sync_stop() after the same-step log/eval/save, mirroring the
+                # on_step_end deferral below.
+                self._distributed_should_stop()
+            # Charge this micro-batch to the PENDING window; it folds into
+            # COMMITTED on an applied update, so train_time covers exactly the
+            # micro-batches whose tokens are in n_tokens.
+            pending_time += time.perf_counter() - tic
+            if do_update:
+                train_time += pending_time
+                pending_time = 0
 
             # Only log/eval on actual optimizer steps
             if not do_update:
+                accum_progress += 1
+                _fire("on_substep_end")
+                # Do NOT latch a callback should_training_stop into stop_requested
+                # yet. When this non-update microstep is also an epoch boundary,
+                # _maybe_callback_epoch_end below fires on_epoch_end and may run a
+                # same-epoch eval; latching the stop now would make that eval's
+                # _evaluate_batch_totals skip every batch (it is gated on not
+                # stop_requested), reporting 0.0 loss and corrupting best-model /
+                # early-stopping state. OR-reduce only an external cancel here; the
+                # callback stop is applied by the tail _sync_stop() below after the
+                # epoch-end log/eval/save, mirroring the on_step_end / on_optimizer_
+                # step deferrals in the update branch.
+                self._distributed_should_stop()
+                # An epoch boundary can fall on a non-update microstep when
+                # batches-per-epoch is not a multiple of grad_accum (for example
+                # 3 micro-batches with grad_accum=2). HF always fires on_epoch_end
+                # once per epoch (its final batch forces an optimizer step), so
+                # fire it here too; otherwise on_epoch_end and any log/eval/save/
+                # stop it requests are dropped for that epoch. _maybe_callback_
+                # epoch_end is a no-op away from a boundary and runs the same
+                # collectives on every rank (it/batches_per_epoch are rank-
+                # consistent), so DDP stays in lockstep.
+                _maybe_callback_epoch_end(it, self._global_step, grad_norm)
+                # Honor should_epoch_stop set from on_substep_end. HF checks
+                # should_epoch_stop after every inner-loop iteration -- including
+                # non-update substeps -- and breaks immediately, abandoning the
+                # partial accumulation window (transformers _inner_training_loop:
+                # the should_epoch_stop/should_training_stop break fires after
+                # on_substep_end, before any deferred optimizer step). Without this
+                # the loop would finish the current window and apply an extra
+                # optimizer update using the ended epoch's tail (and, when
+                # batches_per_epoch is not a multiple of grad_accum, wrapped
+                # next-epoch) batches. Discard the partial gradient and skip to the
+                # next boundary, matching HF. Runs wherever the epoch length is
+                # known: _honor_epoch_stop_skip advances an index for materialized
+                # batches and drains the producer for declared-length streams; a
+                # length-less stream leaves batches_per_epoch None. Gated on the
+                # all-reduced flag so every rank abandons the same window and skips
+                # the same micro-batches in lockstep. A natural boundary already
+                # fired on_epoch_end above, so only the mid-epoch skip fires it.
+                if batches_per_epoch and _sync_epoch_stop():
+                    if it % batches_per_epoch != 0:
+                        # Mid-epoch: abandon the partial accumulation window like
+                        # HF's mid-window break, then skip the epoch's remaining
+                        # micro-batches. Only here -- at a boundary substep
+                        # (it % batches_per_epoch == 0) there is no tail to skip and
+                        # the normal loop carries this micro-batch's gradient into
+                        # the next accumulation window, so discarding it would drop
+                        # the epoch's final batch from the optimizer update while
+                        # its loss/tokens were already counted.
+                        grad_accum_state = None      # abandon the partial window
+                        accum_progress = 0
+                        # The abandoned micro-batches never updated the model, so
+                        # their loss/tokens must not surface in a forced epoch-end
+                        # log or inflate trained_tokens. Drop ONLY the PENDING
+                        # window here (mirroring that the discarded gradient is
+                        # dropped) -- reporting un-applied data would misstate the
+                        # logged train loss and token throughput. The COMMITTED
+                        # window (already-applied optimizer steps not yet logged)
+                        # survives so a truncated epoch-end forced log still reports
+                        # the completed update, matching HF (which logs applied
+                        # steps at on_epoch_end, never the abandoned partial window).
+                        pending_losses = 0
+                        pending_n_tokens = 0
+                        pending_steps = 0
+                        # Drop the abandoned window's time with its tokens, else
+                        # the next window's tokens/s is deflated by it.
+                        pending_time = 0
+                        it = _honor_epoch_stop_skip(
+                            it, self._global_step, grad_norm)
+                    self.control.should_epoch_stop = False
+                # Apply any deferred callback stop (from on_substep_end or the
+                # epoch-end callbacks) now that the epoch-end eval has run. This
+                # tail _sync_stop() runs on every rank in the same order as the
+                # update branch's tail, so DDP stays in lockstep; the continue then
+                # routes to the top-of-loop _distributed_should_stop(), which drains
+                # the stop on every rank before the next collective.
+                _sync_stop()
+                microstep = it
                 continue
 
-            self._global_step = it // grad_accum
-            current_step = self._global_step
+            current_step = self._global_step + 1
+            self._global_step = current_step
+            self.state.global_step = current_step
+            accum_progress = 0
+            # Advance the callback epoch only on an optimizer step, beside the
+            # global_step it belongs to and just before on_step_end -- HF's
+            # `state.global_step += 1; state.epoch = epoch + (step+1)/
+            # steps_in_epoch; on_step_end` (transformers _inner_training_loop).
+            # Updating it on every micro-batch instead left on_substep_end
+            # reporting an epoch a micro-batch ahead of the last completed step.
+            # Epoch boundaries are unaffected: _maybe_callback_epoch_end and the
+            # truncated-epoch closes set the epoch themselves before firing.
+            if epoch_event_microbatches:
+                self.state.epoch = it / epoch_event_microbatches
+            # The loop's own step cadence for the two requests the static
+            # interval below cannot express -- logging_first_step and the
+            # final-step force -- raised where HF's flow raises them and folded
+            # into the same control flags, so an installed flow coalesces.
+            self._request_step_cadence_actions()
+            _fire("on_step_end")
+            # on_step_end may request log/eval/save or a stop, and a rank-dependent
+            # callback can do so on a subset. Sync those decisions before the
+            # collective log/eval/save paths so every rank makes the same choice.
+            self._distributed_sync_control_actions()
+            # Do NOT copy a callback should_training_stop into stop_requested yet.
+            # HF runs this step's log/evaluate/save before the loop breaks, so a
+            # stop requested on on_step_end must not pre-empt a same-step eval:
+            # _evaluate_batch_totals skips every eval batch while stop_requested
+            # is set, which would report 0.0 loss and corrupt best-model /
+            # early-stopping state. Only OR-reduce any external cancel here (a
+            # rank-consistent hard stop); the callback stop is applied after the
+            # same-step actions by the tail _sync_stop() below.
+            self._distributed_should_stop()
 
-            # Logging
-            if current_step % args.logging_steps == 0 or current_step == total_steps:
-                metric_losses = self._distributed_all_sum(losses, stream=mx.cpu)
-                metric_tokens = self._distributed_all_sum(n_tokens, stream=mx.cpu)
-                mx.eval(metric_losses, metric_tokens)
-                train_loss = (
-                    (metric_losses / metric_tokens).item()
-                    if metric_tokens.item() > 0 else 0.0
+            # Logging. Cadences come from self.state as HF-resolved absolute
+            # counts, each guarded against 0; the synced control flag can also
+            # force a log. _run_training_log all-reduces the totals.
+            logging_steps = int(getattr(self.state, "logging_steps", 0) or 0)
+            eval_steps = int(getattr(self.state, "eval_steps", 0) or 0)
+            save_steps = int(getattr(self.state, "save_steps", 0) or 0)
+            # The static interval mirrors DefaultFlowCallback's step-strategy
+            # rule (strategy is STEPS, on a multiple of logging_steps); a
+            # caller-supplied "no" must not log and "epoch" must leave the
+            # cadence to on_epoch_end rather than logging on both. An explicit
+            # callback request stays independent of the strategy, as does the
+            # final-step flush that folds the run's last window into the
+            # returned train_loss.
+            should_log = (
+                (
+                    logging_steps > 0
+                    and current_step % logging_steps == 0
+                    and self._static_log_cadence_enabled()
                 )
-                local_tok_count = int(n_tokens.item())
-                tok_count = int(metric_tokens.item())
-                trained_tokens += tok_count
-                lr_val = optimizer.learning_rate.item()
-                tokens_sec = tok_count / train_time if train_time > 0 else 0
-                peak_mem = mx.get_peak_memory() / 1e9
-
-                self._train_loss_history.append(train_loss)
-                grad_norm_val = (
-                    float(grad_norm.item())
-                    if grad_norm is not None else None
-                )
-                if grad_norm_val is not None:
-                    self._grad_norm_history.append(grad_norm_val)
-                self._tokens_per_second_history.append(tokens_sec)
-                self._peak_memory_history.append(peak_mem)
-                self._step_times.append(train_time / steps if steps > 0 else 0)
-                self._local_token_count_history.append(local_tok_count)
-                self._global_token_count_history.append(tok_count)
-
-                # Benchmark hook: reset peak memory after warmup
-                reset_after = getattr(self, '_benchmark_reset_peak_after_step', 0)
-                if reset_after > 0 and current_step == reset_after:
-                    mx.synchronize()
-                    mx.reset_peak_memory()
-
-                elapsed_total = time.perf_counter() - start_time
-
-                grad_text = (
-                    f"Grad: {grad_norm_val:.4f} | "
-                    if grad_norm_val is not None else ""
-                )
-                _main_print(
-                    f"  Step {current_step}/{total_steps} | "
-                    f"Loss: {train_loss:.4f} | "
-                    f"{grad_text}"
-                    f"LR: {lr_val:.2e} | "
-                    f"Tok/s: {tokens_sec:.0f} | "
-                    f"Peak: {peak_mem:.2f} GB"
-                )
-
-                if is_main_process:
-                    for cb in self._step_callbacks:
-                        try:
-                            cb(
-                                current_step, total_steps, train_loss, lr_val,
-                                tokens_sec, peak_mem, elapsed_total, trained_tokens,
-                                grad_norm_val,
-                            )
-                        except Exception as e:
-                            _main_print(f"Unsloth: step callback error: {e}")
-
-                losses = 0
-                n_tokens = 0
-                steps = 0
-                train_time = 0
-
-            # Eval
-            if (eval_batches and args.eval_steps > 0
-                    and current_step % args.eval_steps == 0):
-                _pf = (
-                    self._mlx_prefetch_control.get("prefetcher")
-                    if getattr(self, "_mlx_prefetch_control", None) else None
-                )
-                if _pf is not None:
-                    _pf.quiesce()
-                try:
-                    val_loss, ppl = self._evaluate(
-                        eval_batches, loss_fn, is_vlm=is_vlm)
-                finally:
-                    if _pf is not None:
-                        _pf.resume()
-                model.train()
-                _main_print(
-                    f"  Eval  {current_step}/{total_steps} | "
-                    f"Val Loss: {val_loss:.4f} | "
-                    f"Perplexity: {ppl:.2f}"
-                )
-                if is_main_process:
-                    for cb in self._eval_callbacks:
-                        try:
-                            cb(current_step, val_loss, ppl)
-                        except Exception as e:
-                            _main_print(f"Unsloth: eval callback error: {e}")
-
-                # Eval callbacks fire on rank 0 only, so a callback (or an
-                # external cancel arriving mid-eval) that sets stop_requested is
-                # initially visible on rank 0 alone. Sync it across ranks before
-                # the best-model / early-stopping branch below: otherwise _track
-                # diverges (rank 0 skips, peers enter) and the rank-0-guarded
-                # best-model save collective in _track hangs the peer ranks.
-                self._distributed_should_stop()
-
-                # Best-model tracking + early stopping (Item-5). Skipped after
-                # a stop request: an aborted eval leaves partial metrics (a
-                # truncated eval_loss can beat any real best) and may lack the
-                # tracked key entirely.
-                _track = not self.stop_requested and (
-                    getattr(args, "load_best_model_at_end", False)
-                    or int(getattr(args, "early_stopping_patience", 0) or 0) > 0
-                )
-                if _track:
-                    _metric_name = self._resolved_best_metric_name()
-                    _em = self._last_eval_metrics or {}
-                    if _metric_name not in _em:
-                        raise ValueError(
-                            f"metric_for_best_model={_metric_name!r} not in eval "
-                            f"metrics; available: {sorted(_em)}"
-                        )
-                    _cur = _em[_metric_name]
-                    _greater = bool(getattr(args, "greater_is_better", False))
-                    _improved = (
-                        _cur == _cur  # reject NaN: a diverged eval must never become "best"
-                        and (
-                            self._best_metric is None
-                            or (_cur > self._best_metric if _greater else _cur < self._best_metric)
-                        )
-                    )
-                    if _improved:
-                        self._best_metric = _cur
-                        self._best_step = current_step
-                        self._es_patience_counter = 0
-                        # Bookkeeping runs on every rank to keep early-stopping
-                        # in lockstep; only rank 0 writes output_dir/best. Sync
-                        # save failures across ranks so a rank-0 error does not
-                        # hang peers at the next collective.
-                        best_save_error = None
-                        if is_main_process:
-                            try:
-                                save_trainable_adapters(model, f"{args.output_dir}/best")
-                            except ValueError as e:
-                                print(f"  Unsloth: skipped best-model save ({e})")
-                            except BaseException as e:
-                                best_save_error = e
-                        self._raise_distributed_failure(
-                            best_save_error is not None,
-                            "best-model save",
-                            best_save_error,
-                        )
-                    else:
-                        self._es_patience_counter += 1
-                        _pat = int(getattr(args, "early_stopping_patience", 0) or 0)
-                        if _pat > 0 and self._es_patience_counter >= _pat:
-                            _main_print(
-                                f"Unsloth: early stopping at step {current_step} "
-                                f"(no {_metric_name} improvement in {_pat} evals)."
-                            )
-                            self._early_stopped = True
-
-            # Checkpointing
-            checkpoint_due = (
-                args.save_steps > 0
-                and current_step % args.save_steps == 0
+                or current_step == total_steps
+                or self.control.should_log
             )
-            if checkpoint_due:
-                checkpoint_error = None
-                if is_main_process:
-                    ckpt_dir = f"{args.output_dir}/checkpoint-{current_step}"
-                    try:
-                        try:
-                            save_trainable_adapters(model, ckpt_dir)
-                        except ValueError as e:
-                            _main_print(f"  Unsloth: skipped checkpoint ({e})")
-                        else:
-                            # Also write optimizer + trainer state so
-                            # resume_from_checkpoint restores Adam moments, step
-                            # counter, loss history, and best-model / early-stopping
-                            # tracking. Best-effort: the adapter save already
-                            # succeeded, so log failures but keep it.
-                            checkpoint_complete = False
-                            try:
-                                save_optimizer_state(optimizer, ckpt_dir)
-                                save_trainer_state(
-                                    {
-                                        "global_step": current_step,
-                                        "train_loss_history": list(
-                                            self._train_loss_history
-                                        ),
-                                        "best_metric": self._best_metric,
-                                        "best_step": self._best_step,
-                                        "es_patience_counter": self._es_patience_counter,
-                                    },
-                                    ckpt_dir,
-                                )
-                                checkpoint_complete = True
-                            except Exception as e:
-                                _main_print(
-                                    "  Unsloth: checkpoint saved without "
-                                    f"resume state ({e})"
-                                )
-                            _main_print(f"  Saved checkpoint to {ckpt_dir}")
-                            if checkpoint_complete:
-                                _prune_stale_checkpoints(
-                                    args.output_dir,
-                                    args.save_total_limit,
-                                )
-                    except BaseException as e:
-                        checkpoint_error = e
-                self._raise_distributed_failure(
-                    checkpoint_error is not None,
-                    "checkpoint save",
-                    checkpoint_error,
-                )
+            if should_log:
+                _run_training_log(current_step, grad_norm)
 
+            # Eval (cadence or a synced callback request). _run_eval builds eval
+            # batches lazily on every rank, runs the collective eval, then fires
+            # on_evaluate on rank 0 and syncs any stop before best tracking.
+            # The static cadence mirrors DefaultFlowCallback's step-strategy
+            # rule (strategy is STEPS, on a multiple of eval_steps, past
+            # eval_delay); an explicit callback request stays independent of
+            # the strategy, exactly as HF honors control.should_evaluate
+            # whoever raised it.
+            should_eval = (
+                self.eval_dataset is not None
+                and (
+                    (
+                        eval_steps > 0
+                        and current_step % eval_steps == 0
+                        and self._static_eval_cadence_enabled()
+                        and self._eval_delay_satisfied(current_step)
+                    )
+                    or self.control.should_evaluate
+                )
+            )
+            if should_eval:
+                if _run_eval(current_step):
+                    _run_best_tracking(current_step)
+
+            # Checkpointing (cadence or a synced callback request). _run_checkpoint
+            # writes on rank 0 and syncs save failures across ranks.
+            # The static cadence mirrors DefaultFlowCallback's step-strategy
+            # rule (strategy is STEPS, on a multiple of save_steps): a
+            # caller-supplied "no" must write no step checkpoints even though
+            # save_steps keeps its default 500, and "epoch" must leave the
+            # cadence to on_epoch_end instead of writing checkpoint-N twice at
+            # every boundary. An explicit callback request stays independent of
+            # the strategy, which is also how the final-step checkpoint arrives
+            # (DefaultFlowCallback forces should_save at max_steps).
+            should_save = (
+                (
+                    save_steps > 0
+                    and current_step % save_steps == 0
+                    and self._static_save_cadence_enabled()
+                )
+                or self.control.should_save
+            )
+            if should_save:
+                _run_checkpoint(current_step)
+
+            _maybe_callback_epoch_end(it, current_step, grad_norm)
+            # Honor a callback that ended the current epoch early
+            # (control.should_epoch_stop), mirroring HF's `if should_epoch_stop:
+            # break` of the per-epoch step loop: end this epoch now and skip its
+            # remaining micro-batches so the next iteration begins a fresh epoch.
+            # Applied here at a clean optimizer-step boundary (accum_progress was
+            # just reset to 0), so no partial gradient accumulation is abandoned.
+            # Runs for any known epoch length: materialized batches fast-forward
+            # batch_idx, declared-length streams drain the producer to the same
+            # boundary. A length-less stream has batches_per_epoch None and fires no
+            # epoch events at all. The skip is rank-consistent arithmetic gated on
+            # _sync_epoch_stop, so DDP stays in lockstep. A natural boundary already
+            # fired on_epoch_end above, so only skip when mid-epoch.
+            if batches_per_epoch and _sync_epoch_stop():
+                if it % batches_per_epoch != 0:
+                    it = _honor_epoch_stop_skip(it, current_step, grad_norm)
+                self.control.should_epoch_stop = False
+            # Advance the completed-micro-batch counter before the stop check so a
+            # callback-stop break still leaves `microstep` pointing at the step
+            # just finished; the post-loop truncated-epoch on_epoch_end reads it to
+            # decide whether the final epoch was left open.
+            microstep = it
+            # Propagate any stop set by the tail callbacks (on_step_end / on_log /
+            # on_evaluate / on_save / on_epoch_end) to every rank before breaking,
+            # so no rank is left waiting at the next collective.
+            if _sync_stop():
+                break
+
+        # Close a truncated final epoch: if the loop left off mid-epoch (max_steps
+        # landing off a dataset boundary, or a should_training_stop break) the
+        # natural-boundary on_epoch_end never fired for that partial epoch. HF
+        # fires on_epoch_end for the truncated epoch after its inner step loop
+        # breaks (transformers _inner_training_loop), so mirror it here before the
+        # final metric flush and on_train_end. A natural boundary already fired it
+        # (microstep % epoch_event_microbatches == 0), as did the should_epoch_stop
+        # skip (which advances microstep to a boundary), so the guard prevents a
+        # double fire. Both quantities are rank-consistent, so on_epoch_end and its
+        # synced log/eval/save run in DDP lockstep. A declared-length streaming
+        # epoch run carries the same boundaries as a materialized one and closes
+        # its final epoch here on the same terms; a length-less stream stopped
+        # short of its synthetic horizon closes that horizon's epoch here, as HF
+        # does after its own should_training_stop break.
+        if (epoch_event_microbatches
+                and microstep % epoch_event_microbatches != 0):
+            self.state.epoch = microstep / epoch_event_microbatches
+            # Same for the truncated final epoch: HF's on_epoch_end after the
+            # inner loop breaks feeds _maybe_log_save_evaluate, so an "epoch"
+            # strategy still gets this boundary's action.
+            self._request_epoch_cadence_actions()
+            _fire("on_epoch_end")
+            self._distributed_sync_control_actions()
+            if (self.control.should_log or self.control.should_evaluate
+                    or self.control.should_save):
+                # A callback that stopped training mid-epoch (should_training_stop)
+                # has already latched stop_requested via the tail _sync_stop(), so
+                # a requested epoch-end eval would hit _evaluate_batch_totals'
+                # `not stop_requested` gate, skip every batch, and dispatch a
+                # phantom 0.0 eval to on_log/on_evaluate -- corrupting best-model /
+                # early-stopping state. HF runs a real epoch-end eval for a callback
+                # stop (_maybe_log_save_evaluate before the loop break), so lift the
+                # callback stop around these final actions and restore it after. A
+                # hard external cancel (stop_requested without a callback
+                # should_training_stop) keeps its suppression: skip the actions
+                # entirely rather than emit a phantom eval. should_training_stop is
+                # rank-dependent, so OR-reduce it for a consistent decision; the
+                # synced control flags above already put every rank in this branch,
+                # so the collective stays in lockstep.
+                _callback_stop = self._distributed_any_flag(
+                    getattr(self.control, "should_training_stop", False))
+                if not self.stop_requested or _callback_stop:
+                    _restore_stop = self.stop_requested
+                    self.stop_requested = False
+                    try:
+                        _run_callback_control_actions(self._global_step, None)
+                    finally:
+                        self.stop_requested = _restore_stop
+
+        # Flush any completed-but-unlogged optimizer-step window so the returned
+        # train_loss/trained_tokens include the final steps when training stops
+        # between log points (a should_training_stop callback or external cancel at
+        # a step that is not a logging_steps multiple and not the last step). HF
+        # folds the trailing tr_loss into _total_loss_scalar before computing the
+        # returned train_loss; without this an early stop at an unlogged step would
+        # return train_loss/trained_tokens of 0 despite completed training.
+        # Gate on the COMMITTED window (steps > 0): a stop from on_substep_end or an
+        # external cancel can break mid-accumulation with a PENDING partial window
+        # that never reached an optimizer update (its micro-batches never updated
+        # the model), but those live in pending_losses/pending_n_tokens/pending_steps
+        # and are excluded here, so the flush reports only applied steps -- HF
+        # likewise never logs a not-yet-applied window (global_step ==
+        # _globalstep_last_logged). Because committed excludes the pending window,
+        # this fires even when a partial window is pending after an earlier applied
+        # step (grad_accum>1, on_substep_end stop mid-window): the completed update
+        # is still emitted rather than dropped. steps advances identically on every
+        # rank, so the guard is rank-consistent and _run_training_log's all-reduce
+        # stays in lockstep. A full run forces a log on the last step (current_step
+        # == total_steps) and the on_epoch_end above may also flush, both resetting
+        # steps to 0, so this never double-counts.
+        if steps > 0:
+            _run_training_log(self._global_step, None)
+
+        # Token-weighted, so the returned loss is cadence-free like HF's
+        # (_total_loss_scalar / effective_global_step). Falls back to the plain
+        # window mean when the weights are unavailable (legacy resume, 0 tokens).
+        if self._train_loss_weighting_ok and self._train_loss_token_total > 0:
+            avg_loss = self._train_loss_token_sum / self._train_loss_token_total
+        else:
+            avg_loss = (
+                sum(self._train_loss_history) / len(self._train_loss_history)
+                if self._train_loss_history else 0.0
+            )
+        # Total wall-clock training time, consumed by the summary line and the
+        # distributed diagnostics / train_runtime metrics below.
         total_time = time.perf_counter() - start_time
-        avg_loss = (
-            sum(self._train_loss_history) / len(self._train_loss_history)
-            if self._train_loss_history else 0.0
-        )
 
         # Report the step actually reached, which is < total_steps after an
         # early stop (self._global_step == total_steps on a full run).
@@ -4198,7 +6459,9 @@ class MLXTrainer:
             final_save_error,
         )
 
-        return MLXTrainOutput({
+        # The run's aggregate metrics, dispatched below and returned unchanged so
+        # a caller reading MLXTrainOutput and a callback reading on_log agree.
+        final_metrics = {
             "train_loss": avg_loss,
             "train_runtime": total_time,
             "train_steps": completed_steps,
@@ -4207,6 +6470,47 @@ class MLXTrainer:
             "train_samples_per_second": (
                 trained_tokens / total_time if total_time > 0 else 0
             ),
+        }
+        # HF logs these through Trainer.log immediately before on_train_end
+        # (trainer.py _finalize_training on 5.x, the tail of
+        # _inner_training_loop on 4.x), so they land in state.log_history and
+        # reach on_log: that is how WandbCallback promotes train_loss /
+        # train_runtime into the run summary and how a resumed run's history
+        # keeps the previous run's totals. Unconditional there and here -- it is
+        # not a DefaultFlowCallback cadence, so logging_strategy="no" still gets
+        # this one payload. Every rank appends and fires, like _run_training_log.
+        _final_log = dict(final_metrics)
+        if self.state.epoch is not None:
+            _final_log["epoch"] = self.state.epoch
+        _final_record = dict(_final_log)
+        _final_record["step"] = self.state.global_step
+        self.state.log_history.append(_final_record)
+        _fire("on_log", logs=_final_log)
+
+        # HF's WandbCallback and DVCLiveCallback log their final-model artifact by
+        # constructing a Torch Trainer around this (MLX) model, which raises
+        # AttributeError and would throw away the finished run's result. Skip just
+        # that artifact, keep the rest of on_train_end (DVCLive's live.end() trails
+        # it), restore the user's callbacks afterwards.
+        _final_artifact_modes = self._suppress_torch_only_final_artifacts()
+        if _final_artifact_modes:
+            _suppressed_names = sorted(
+                {type(callback).__name__ for callback, _ in _final_artifact_modes}
+            )
+            _main_print(
+                f"Unsloth: {', '.join(_suppressed_names)} final-model artifacts "
+                "need a Torch Trainer and a torch.nn.Module, so they are skipped "
+                "for MLX runs. Adapters were still saved to "
+                f"{args.output_dir}; per-checkpoint artifacts are unaffected."
+            )
+        try:
+            _fire("on_train_end")
+        finally:
+            self._restore_final_artifact_modes(_final_artifact_modes)
+        _sync_stop()
+
+        return MLXTrainOutput({
+            **final_metrics,
             "compile_enabled": bool(_use_compile),
             "compile_support_state": (
                 _compile_decision.support_state if _compile_decision is not None else "n/a"
@@ -4879,6 +7183,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     rng = random.Random(_normalize_seed(seed))
     schedule = []
     widths = []
+    cycle_length = None
     global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
     for epoch_idx in range(_n_epochs_materialize):
         epoch_order = _order_indices_for_epoch(epoch_idx)
@@ -4913,6 +7218,9 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         for batch_indices, padded_len in epoch_schedule:
             schedule.append(batch_indices)
             widths.append(padded_len)
+        # One dataset pass == this epoch's micro-batch count (pre-truncation).
+        if cycle_length is None and len(epoch_schedule) > 0:
+            cycle_length = len(epoch_schedule)
 
     # Limit if needed
     if num_batches is not None and len(schedule) > num_batches:
@@ -4929,6 +7237,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             for input_ids, labels in all_items
         ),
         schedule,
+        cycle_length=cycle_length,
         max_seq_length=max_seq_length,
         pad_id=pad_id,
         minimum_width=2,
