@@ -1355,6 +1355,148 @@ jobs:
           if __name__ == "__main__":
               pass
           PY
+      - name: "952 (informational): real mlx-community Qwen3-VL-2B-Instruct-4bit"
+        if: always()
+        continue-on-error: true
+        run: |
+          export PROBE_EXPECT_ZOO_ROOT=$GITHUB_WORKSPACE
+          python - <<'PY'
+          """PROBE-QQ: PR 952 against a real mlx-community quant, not a stubbed model.
+
+          Loads mlx-community/Qwen3-VL-2B-Instruct-4bit with its own processor, vision
+          tower and quantized weights, builds a mixed batch whose VISUAL row is the
+          left-padded one, drives it through mlx-vlm's real _merge_prefill_prompt_kwargs
+          and PromptProcessingBatch with a small prefill_step_size so the prefill chunks,
+          and compares each row's final-token logits against that row prefilled alone.
+
+          Informational by construction: it downloads from the Hub, so a network or disk
+          failure here is not a defect of the PR. Its numbers are reported either way.
+
+          This cannot run on the Linux CPU backend: one 8-token forward pass of this
+          4bit quant measured 75 s there, so the probe belongs on Metal.
+          """
+
+          import importlib
+          import os
+          import sys
+
+          ROOT = os.environ.get("PROBE_EXPECT_ZOO_ROOT")
+          if ROOT:
+              sys.path.insert(0, ROOT)
+
+          import mlx.core as mx  # noqa: E402
+          import numpy as np  # noqa: E402
+          from PIL import Image  # noqa: E402
+
+          REPO = "mlx-community/Qwen3-VL-2B-Instruct-4bit"
+
+          import unsloth_zoo.mlx.compile as mc  # noqa: E402
+
+          mc.install_mlx_compile_patches()
+
+          from mlx_vlm import load  # noqa: E402
+          from mlx_vlm.prompt_utils import apply_chat_template  # noqa: E402
+          from mlx_vlm.utils import prepare_inputs  # noqa: E402
+
+          ar = importlib.import_module("mlx_vlm.generate.ar")
+
+          model, processor = load(REPO)
+          config = model.config
+          print("PROBE-QQ loaded", REPO, "as", type(model).__name__)
+
+
+          def make_image(seed, size=224):
+              rng = np.random.RandomState(seed)
+              return Image.fromarray(rng.randint(0, 255, (size, size, 3), dtype=np.uint8))
+
+
+          def row_kwargs(text, images):
+              prompt = apply_chat_template(processor, config, text, num_images=len(images))
+              inputs = prepare_inputs(
+                  processor,
+                  images=images or None,
+                  prompts=prompt,
+                  image_token_index=getattr(
+                      config, "image_token_index", getattr(config, "image_token_id", None)
+                  ),
+              )
+              ids = inputs["input_ids"]
+              extra = {
+                  key: value for key, value in inputs.items()
+                  if key not in ("input_ids", "attention_mask")
+              }
+              features = model.get_input_embeddings(ids, **extra)
+              kwargs = (
+                  features.to_dict() if hasattr(features, "to_dict")
+                  else {"inputs_embeds": features}
+              )
+              return ids[0].tolist(), kwargs
+
+
+          def prefill(rows, step):
+              inputs_embeds, merged = ar._merge_prefill_prompt_kwargs(
+                  [kw for _ids, kw in rows], [ids for ids, _kw in rows]
+              )
+              batch = ar.PromptProcessingBatch(
+                  model=model.language_model,
+                  uids=list(range(len(rows))),
+                  input_ids=[ids for ids, _kw in rows],
+                  max_tokens=[1] * len(rows),
+                  inputs_embeds=inputs_embeds,
+                  prompt_kwargs=merged,
+                  prefill_step_size=step,
+              )
+              calls = 0
+              while batch.needs_processing():
+                  if batch.prompt_step() == 0:
+                      break
+                  calls += 1
+              out = batch.model(
+                  batch._input_ids, cache=batch.prompt_cache,
+                  inputs_embeds=batch._inputs_embeds, **dict(batch._prompt_kwargs),
+              )
+              logits = out.logits if hasattr(out, "logits") else out
+              mx.eval(logits)
+              return logits[:, -1, :], calls
+
+
+          # The long text row forces real left padding onto the SHORT visual row, which
+          # is the only arrangement where the compact positions and the merged mask can
+          # disagree.
+          FILLER = " Please answer carefully and completely in your own words."
+          SPECS = [
+              ("Describe this picture.", [make_image(1)]),
+              ("Summarise the following." + FILLER * 12, []),
+          ]
+          rows = [row_kwargs(text, images) for text, images in SPECS]
+          lengths = [len(ids) for ids, _kw in rows]
+          pads = [max(lengths) - n for n in lengths]
+          print(f"PROBE-QQ row lengths={lengths} left_padding={pads}")
+          if pads[0] <= 0:
+              sys.exit("PROBE-QQ FAIL: the visual row is not left-padded, case not exercised")
+
+          worst = 0.0
+          for step in (max(lengths) + 8, 32, 16):
+              batched, calls = prefill(rows, step)
+              label = "single call" if calls <= 1 else f"{calls} chunks"
+              for i, (_text, images) in enumerate(SPECS):
+                  solo, _ = prefill([rows[i]], 4096)
+                  dev = float(mx.abs(batched[i] - solo[0]).max().item())
+                  worst = max(worst, dev)
+                  kind = "image" if images else "text "
+                  print(
+                      f"PROBE-QQ step={step:>3} ({label:<11}) row={i} {kind} "
+                      f"len={lengths[i]:>3} pad={pads[i]:>3} "
+                      f"max|batched - solo|={dev:.6f}"
+                  )
+
+          print(f"PROBE-QQ worst deviation {worst:.6f}")
+          # Metal reorders a batched matmul against a solo one, so an exact zero is not
+          # available on real weights; the pre-fix deviations this catches are 1e-2 and up.
+          if worst > 5e-3:
+              sys.exit(f"PROBE-QQ FAIL: worst row deviation {worst:.6f} on real weights")
+          print("PROBE-QQ OK: every row of a chunked real-quant batch matches its solo run")
+          PY
       - name: "952 cross-version (informational): the same probe on mlx-vlm 0.6.7"
         if: always()
         continue-on-error: true
