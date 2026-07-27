@@ -2941,6 +2941,269 @@ def test_qwen3_vl_training_compile_verified():
     assert "qwen3_vl_moe" in mc._VERIFIED_TRAINING_ARCHES
 
 
+def test_qwen3_visual_window_preserves_batched_row_ownership():
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    masks = mx.array([[0, 1, 1, 0, 1, 0], [1, 0, 1, 1, 0, 0]], dtype=mx.bool_)
+    embeds = [mx.array([[10], [11], [12], [20], [21], [22]])]
+
+    padded_cache = [types.SimpleNamespace(offset=mx.array([0, -2]), left_padding=mx.array([0, 2]))]
+    assert mc._qwen3_cache_offsets(padded_cache, batch_size=2) == ((0, -2), (0, 0))
+
+    packed, positions = mc._pack_qwen3_visual_state(masks, embeds)
+    assert packed.shape == (2, 3, 1, 1)
+    assert positions.tolist() == [[1, 2, 4], [0, 2, 3]]
+    window_masks, window_embeds = mc._qwen3_visual_window(
+        masks, packed, positions, mask_offsets=(1, 1), feature_offsets=(1, 1), window=2
+    )
+    assert window_masks.tolist() == [[1, 1], [0, 1]]
+    assert window_embeds[0].tolist() == [[10], [11], [21]]
+
+    def drops_deepstack(self):
+        deepstack_visual_embeds = mx.eval([])
+        return deepstack_visual_embeds
+
+    assert mc._qwen3_drops_deepstack_after_eval(drops_deepstack)
+
+    language_calls = []
+
+    def native_language(
+        self,
+        inputs,
+        inputs_embeds=None,
+        mask=None,
+        cache=None,
+        visual_pos_masks=None,
+        deepstack_visual_embeds=None,
+        **kwargs,
+    ):
+        if visual_pos_masks.shape[-1] != inputs.shape[-1]:
+            start = int(cache[0].offset)
+            window = inputs.shape[1]
+            n_before = int(visual_pos_masks[:, :start].sum().item())
+            n_window = int(
+                visual_pos_masks[:, start : start + window].sum().item()
+            )
+            deepstack_visual_embeds = [
+                layer[n_before : n_before + n_window]
+                for layer in deepstack_visual_embeds
+            ]
+            visual_pos_masks = visual_pos_masks[:, start : start + window]
+        language_calls.append((visual_pos_masks, deepstack_visual_embeds))
+
+    language_adapter = mc._qwen3_visual_state_adapter(native_language)
+    language_adapter(
+        object(),
+        mx.zeros((1, 2)),
+        cache=[types.SimpleNamespace(offset=1, left_padding=0)],
+        visual_pos_masks=masks[:1],
+        deepstack_visual_embeds=None,
+        _unsloth_qwen3_visual_state=packed[:1],
+        _unsloth_qwen3_visual_positions=positions[:1],
+    )
+    assert language_calls[0][0].tolist() == [[1, 1]]
+    assert language_calls[0][1][0].tolist() == [[10], [11]]
+
+
+def test_qwen_video_tensor_adapter_is_exact_and_composable():
+    from functools import wraps
+
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    calls = []
+
+    def legacy(self, input_ids=None, pixel_values=None, **kwargs):
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        mask = kwargs.get("mask", None)
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+        if pixel_values is None:
+            return ("text", grid_thw, mask)
+        calls.append((input_ids, pixel_values, kwargs))
+        return pixel_values
+
+    video, image = object(), object()
+    adapted = mc._qwen_video_tensor_adapter(legacy)
+    assert adapted(object(), 1, pixel_values_videos=video, video_grid_thw=2) is video
+    assert adapted(
+        object(), 1, image, pixel_values_videos=video, video_grid_thw=2
+    ) is image
+    expected_kwargs = {"pixel_values_videos": video, "video_grid_thw": 2}
+    assert calls == [(1, video, expected_kwargs), (1, image, expected_kwargs)]
+    assert adapted.__wrapped__ is legacy
+    assert mc._qwen_video_tensor_adapter(adapted) is adapted
+
+    def fixed(self, input_ids=None, pixel_values=None, **kwargs):
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        return pixel_values, video_grid_thw
+
+    assert mc._qwen_video_tensor_adapter(fixed) is fixed
+
+    def unknown(self, input_ids=None, pixel_values=None, **kwargs):
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        if pixel_values is None:
+            kwargs.pop("pixel_values_videos", None)
+            return ("text", video_grid_thw)
+
+    assert mc._qwen_video_tensor_adapter(unknown) is unknown
+
+    def unreachable(self, input_ids=None, pixel_values=None, **kwargs):
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        if pixel_values is None:
+            return video_grid_thw
+            pixel_values = kwargs.get("pixel_values_videos", None)
+
+    assert not mc._qwen_video_contract_matches(unreachable, "fixed")
+
+    def unreachable_guard(self, input_ids=None, pixel_values=None, **kwargs):
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        mask = kwargs.get("mask", None)
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+        return grid_thw, mask
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos", None)
+
+    assert not mc._qwen_video_contract_matches(unreachable_guard, "fixed")
+    assert not mc._qwen_video_contract_matches(unreachable_guard, "legacy")
+
+    @wraps(legacy)
+    def keyword_outer(self, *, input_ids=None, pixel_values=None, **kwargs):
+        return legacy(
+            self,
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            **kwargs,
+        )
+
+    composed = mc._qwen_video_tensor_adapter(keyword_outer)
+    assert composed(object(), input_ids=3, pixel_values_videos=video) is video
+
+
+    def staged_legacy(self, input_ids=None, pixel_values=None, **kwargs):
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        mask = kwargs.get("mask", None)
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+        if pixel_values is None:
+            return grid_thw, mask, mx.eval([])
+
+    staged = mc._qwen3_batch_embedding_adapter(
+        staged_legacy, replace_visual_inference=True
+    )
+    assert mc._qwen_video_tensor_adapter(staged) is not staged
+    replacing = mc._qwen3_batch_embedding_adapter(
+        staged_legacy, fixed, replace_visual_inference=True
+    )
+    assert mc._qwen_video_tensor_adapter(replacing) is replacing
+
+
+def test_qwen_installers_bind_exact_release_owners(monkeypatch):
+    import unsloth_zoo.mlx.compile as mc
+
+    expected = (
+        "mlx_vlm.models.qwen2_vl.qwen2_vl",
+        "mlx_vlm.models.qwen2_5_vl.qwen2_5_vl",
+        "mlx_vlm.models.qwen3_5.qwen3_5",
+        "mlx_vlm.models.qwen3_vl_moe.qwen3_vl_moe",
+    )
+    assert mc._QWEN_VIDEO_TENSOR_OWNER_MODULES == expected
+    owners = {
+        name: type(name, (), {"get_input_embeddings": lambda self: None})
+        for name in expected
+    }
+    patched, imported = [], []
+
+    def import_module(module_name):
+        imported.append(module_name)
+        return types.SimpleNamespace(Model=owners[module_name])
+
+    monkeypatch.setattr(mc.importlib, "import_module", import_module)
+    monkeypatch.setattr(mc, "_patch_qwen_video_tensor", patched.append)
+    mc._install_qwen_video_tensor_patches()
+    assert imported == list(expected)
+    assert patched == [owners[module_name] for module_name in expected]
+
+    method_names = (
+        "__call__", "_deepstack_process", "get_input_embeddings",
+        "merge_input_ids_with_image_features", "rot_pos_emb",
+        "fast_pos_embed_interpolate", "_build_mixed_prompt_batch",
+    )
+
+    def owner(name):
+        methods = {
+            key: lambda *_args, _name=f"{name}.{key}", **_kwargs: _name
+            for key in method_names
+        }
+        methods["merge_input_ids_with_image_features"] = staticmethod(
+            methods["merge_input_ids_with_image_features"]
+        )
+        return type(name, (), methods)
+
+    dense_model, dense_language = owner("DenseModel"), owner("DenseLanguage")
+    moe_model, moe_language = owner("MoeModel"), owner("MoeLanguage")
+    cold_batch, apc_batch = owner("ColdBatch"), owner("ApcBatch")
+    vision = types.SimpleNamespace(
+        Attention=owner("Attention"),
+        Qwen3VLMoEVisionBlock=owner("VisionBlock"),
+        VisionModel=owner("VisionModel"),
+    )
+    namespace = types.SimpleNamespace
+    generate = namespace(
+        _merge_prefill_prompt_kwargs=cold_batch.get_input_embeddings,
+        BatchGenerator=cold_batch,
+    )
+    generate_ar = namespace(
+        _merge_prefill_prompt_kwargs=apc_batch.get_input_embeddings,
+        BatchGenerator=apc_batch,
+    )
+    modules = {
+        "mlx_vlm.models.qwen3_vl.qwen3_vl": namespace(Model=dense_model),
+        "mlx_vlm.models.qwen3_vl.vision": vision,
+        "mlx_vlm.models.qwen3_5.qwen3_5": namespace(Model=owner("Qwen35")),
+        "mlx_vlm.models.qwen3_vl.language": namespace(
+            Qwen3VLModel=owner("DenseBackbone"), LanguageModel=dense_language),
+        "mlx_vlm.models.qwen3_vl_moe.qwen3_vl_moe": namespace(Model=moe_model),
+        "mlx_vlm.models.qwen3_vl_moe.vision": vision,
+        "mlx_vlm.models.qwen3_vl_moe.language": namespace(
+            Qwen3VLMoEModel=owner("MoeBackbone"), LanguageModel=moe_language),
+        "mlx_vlm.generate": generate,
+        "mlx_vlm.generate.ar": generate_ar,
+    }
+    bindings = (
+        (dense_model, "get_input_embeddings", "_unsloth_qwen3_batch_visual_state"),
+        (moe_model, "get_input_embeddings", "_unsloth_qwen3_batch_visual_state"),
+        (dense_language, "__call__", "_unsloth_qwen3_visual_state"),
+        (moe_language, "__call__", "_unsloth_qwen3_visual_state"),
+        (cold_batch, "_build_mixed_prompt_batch", "_unsloth_qwen3_mixed_prompt_batch"),
+        (apc_batch, "_build_mixed_prompt_batch", "_unsloth_qwen3_mixed_prompt_batch"),
+        (generate, "_merge_prefill_prompt_kwargs", "_unsloth_qwen3_prompt_merge"),
+        (generate_ar, "_merge_prefill_prompt_kwargs", "_unsloth_qwen3_prompt_merge"),
+    )
+    originals = [getattr(owner, name) for owner, name, _marker in bindings]
+    monkeypatch.setattr(mc.importlib, "import_module", modules.__getitem__)
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    mc._install_qwen3_family_compile_patches()
+    for (owner, name, marker), original in zip(bindings, originals):
+        wrapped = getattr(owner, name)
+        assert getattr(wrapped, marker)
+        assert wrapped.__wrapped__ is original
+    called = []
+    monkeypatch.setattr(mc, "_PATCHES_INSTALLED", False)
+    monkeypatch.setattr(mc, "_PATCHED_PATTERN_BUNDLES", set())
+    monkeypatch.setattr(mc, "_install_safe_fused_sdpa_mask_patches", lambda: None)
+    monkeypatch.setattr(mc, "list_compile_pattern_bundles", lambda: ())
+    monkeypatch.setattr(mc, "_install_qwen_video_tensor_patches", lambda: called.append(True))
+    monkeypatch.setattr(mc, "_invalidate_qualification_cache", lambda: None)
+    monkeypatch.setattr(mc, "build_compile_qualifications", lambda: {})
+    assert mc.install_mlx_compile_patches() == {} and called == [True]
+
+
 def test_vlm_compile_patches_preserve_current_upstream_contracts(monkeypatch):
     import mlx.core as mx
     import unsloth_zoo.mlx.compile as mc
@@ -2956,6 +3219,37 @@ def test_vlm_compile_patches_preserve_current_upstream_contracts(monkeypatch):
     assert mc._gemma3n_cache_offset([types.SimpleNamespace(offset=700, _idx=188)]) == 700
     assert mc._gemma3n_cache_offset([types.SimpleNamespace(offset=mx.array([650, 700]), _idx=188)]) == 700
 
+
+def test_legacy_llava_prefill_adapter_is_signature_gated(monkeypatch):
+    import unsloth_zoo.mlx.compile as mc
+
+    calls = []
+
+    def strict(self, inputs, cache=None):
+        calls.append((inputs, cache))
+        return "strict"
+
+    class LegacyLanguage:
+        __call__ = strict
+
+    module = types.SimpleNamespace(LanguageModel=LegacyLanguage)
+    monkeypatch.setattr(mc.importlib, "import_module", lambda name: module)
+    mc._install_legacy_llava_prefill_patch()
+    inputs = object()
+    assert LegacyLanguage()(inputs, cache="cache", n_to_process=4) == "strict"
+    assert calls == [(inputs, "cache")]
+    assert LegacyLanguage.__call__.__wrapped__ is strict
+    assert mc._legacy_vlm_prefill_kwargs_adapter(LegacyLanguage.__call__) is LegacyLanguage.__call__
+    def explicit(self, inputs, n_to_process=None):
+        return n_to_process
+
+    @mc.wraps(strict)
+    def permissive(self, *args, **kwargs):
+        return kwargs
+    assert mc._legacy_vlm_prefill_kwargs_adapter(explicit) is explicit
+    assert mc._legacy_vlm_prefill_kwargs_adapter(permissive) is permissive
+    monkeypatch.setattr(mc.importlib, "import_module", lambda name: (_ for _ in ()).throw(RuntimeError))
+    mc._install_legacy_llava_prefill_patch()
 
 def test_quantized_cce_uses_layer_mode_and_affine_bias_guard():
     import inspect
@@ -3662,3 +3956,127 @@ def test_real_hf_concat_infinite_detection_matches_actual_termination(axis):
                 if produced > 1000:
                     break
             assert produced > 1000
+
+
+def test_qwen3_visual_window_keeps_features_when_mask_spans_whole_window():
+    """A reused prompt cache must not shift the feature window off the mask."""
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    masks = mx.array([[0, 0, 1, 1, 0, 0]], dtype=mx.bool_)
+    embeds = [mx.array([[1], [2]])]
+    packed, positions = mc._pack_qwen3_visual_state(masks, embeds)
+
+    # The mask already covers only the new turn, so an offset carried over from
+    # an earlier turn must not be applied to it a second time.
+    for carried_offset in (0, 6, 20):
+        window_masks, window_embeds = mc._qwen3_visual_window(
+            masks,
+            packed,
+            positions,
+            mask_offsets=(carried_offset,),
+            feature_offsets=(carried_offset,),
+            window=6,
+        )
+        assert window_masks.tolist() == [[0, 0, 1, 1, 0, 0]]
+        assert window_embeds[0].tolist() == [[1], [2]]
+
+
+def test_qwen3_visual_window_keeps_rows_apart_under_left_padding():
+    """Left-padded rows keep their own features instead of borrowing a neighbour's."""
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    # Row 0 is left-padded by 3, so its cache offset is negative at prefill.
+    masks = mx.array([[0, 0, 0, 0, 1, 1], [1, 1, 0, 0, 0, 0]], dtype=mx.bool_)
+    embeds = [mx.array([[1], [2], [3], [4]])]
+    packed, positions = mc._pack_qwen3_visual_state(masks, embeds)
+
+    window_masks, window_embeds = mc._qwen3_visual_window(
+        masks,
+        packed,
+        positions,
+        mask_offsets=(0, 0),
+        feature_offsets=(-3, 0),
+        window=6,
+    )
+    assert window_masks.tolist() == masks.tolist()
+    assert window_embeds[0].tolist() == [[1], [2], [3], [4]]
+
+
+def test_qwen3_cache_offsets_accepts_declared_none_left_padding():
+    """Some cache classes declare left_padding as None rather than omitting it."""
+    import unsloth_zoo.mlx.compile as mc
+
+    cache = [types.SimpleNamespace(offset=0, left_padding=None)]
+    assert mc._qwen3_cache_offsets(cache, batch_size=1) == ((0,), (0,))
+
+
+def test_qwen3_prompt_rows_keep_a_slot_for_text_only_rows():
+    """A text-only row in a mixed batch must not vacate its batch position."""
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    masks = mx.array([[0, 0, 1, 1, 0, 0]], dtype=mx.bool_)
+    state, positions = mc._pack_qwen3_visual_state(
+        masks, [mx.array([[1.0], [2.0]]), mx.array([[3.0], [4.0]])]
+    )
+    text_row = {"inputs_embeds": mx.zeros((1, 4, 1))}
+    visual_row = {
+        "inputs_embeds": mx.zeros((1, 6, 1)),
+        "visual_pos_masks": masks,
+        mc._QWEN3_VISUAL_STATE_KEY: state,
+        mc._QWEN3_VISUAL_POSITIONS_KEY: positions,
+    }
+
+    padded = mc._pad_qwen3_prompt_rows([text_row, visual_row])
+
+    # mlx-vlm concatenates an optional prompt key only over the rows that carry
+    # it, so an absent row slides every later row onto the wrong batch entry.
+    assert all(
+        row.get(mc._QWEN3_VISUAL_STATE_KEY) is not None
+        and row.get(mc._QWEN3_VISUAL_POSITIONS_KEY) is not None
+        and row.get("visual_pos_masks") is not None
+        for row in padded
+    ), "a text-only row must still carry an empty visual state, positions and mask"
+
+    empty_state = padded[0][mc._QWEN3_VISUAL_STATE_KEY]
+    assert tuple(empty_state.shape) == tuple(state.shape)
+    assert float(mx.abs(empty_state).max().item()) == 0.0
+    assert padded[0][mc._QWEN3_VISUAL_POSITIONS_KEY].tolist() == [[-1, -1]]
+    # The synthesized mask spans the row's own prompt so mlx-vlm's
+    # sequence-aligned left padding still recognizes and pads it.
+    assert tuple(padded[0]["visual_pos_masks"].shape) == (1, 4)
+    assert padded[0]["visual_pos_masks"].tolist() == [[False, False, False, False]]
+
+    # The visual row is untouched.
+    assert padded[1][mc._QWEN3_VISUAL_POSITIONS_KEY].tolist() == positions.tolist()
+    assert padded[1]["visual_pos_masks"].tolist() == masks.tolist()
+
+
+def test_qwen3_prompt_rows_left_alone_without_any_visual_row():
+    """Text-only batches keep mlx-vlm's original prompt kwargs untouched."""
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    rows = [{"inputs_embeds": mx.zeros((1, 4, 1))}, {"inputs_embeds": mx.zeros((1, 5, 1))}]
+    assert mc._pad_qwen3_prompt_rows(rows) is rows
+
+
+def test_qwen3_prompt_rows_defer_to_the_native_deepstack_path():
+    """A row still on mlx-vlm's own deepstack keys is left exactly as it is."""
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    masks = mx.array([[0, 1, 1, 0]], dtype=mx.bool_)
+    state, positions = mc._pack_qwen3_visual_state(masks, [mx.array([[1.0], [2.0]])])
+    compact_row = {
+        "inputs_embeds": mx.zeros((1, 4, 1)),
+        "visual_pos_masks": masks,
+        mc._QWEN3_VISUAL_STATE_KEY: state,
+        mc._QWEN3_VISUAL_POSITIONS_KEY: positions,
+    }
+    native_row = {"inputs_embeds": mx.zeros((1, 4, 1)), "visual_pos_masks": masks}
+
+    rows = [native_row, compact_row]
+    assert mc._pad_qwen3_prompt_rows(rows) is rows
