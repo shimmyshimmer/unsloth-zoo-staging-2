@@ -1,0 +1,1476 @@
+# Disposable staging-only verification for upstream PR #952.
+# The repo's mlx-ci.yml aborts at tests/test_qwen35_vjp_metal.py, which fails on upstream
+# main independently of this PR, so its later steps never run. This runs the PR's own MLX
+# tests on Apple Silicon directly, one pytest process per file so the mlx_simulation stub
+# installed by sibling test modules cannot mask the real mlx runtime.
+
+name: "PR 952 MLX verify"
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: pr952-mlx-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: "PR 952 MLX verify (macos-14)"
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install zoo with MLX extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx]
+          pip install pytest==9.0.3
+
+      - name: Versions and real-mlx probe
+        run: |
+          python -c "import platform; print('machine', platform.machine(), platform.platform())"
+          python -c "import mlx.core as mx; print('mlx.core', mx.__file__); print('device', mx.default_device())"
+          python -c "from mlx_lm.models.switch_layers import SwitchLinear, QuantizedSwitchLinear; print('SwitchLinear', SwitchLinear)"
+          # tests/test_mlx_ddp_metal.py per-test-skips unless mlx.launch sits beside sys.executable,
+          # so record its presence explicitly: that decides whether the real 2-rank path can run.
+          python -c "import sys, pathlib; p = pathlib.Path(sys.executable).with_name('mlx.launch'); print('mlx.launch', p, 'exists=', p.exists())"
+          pip list | grep -Ei 'mlx|transformers|torch|numpy'
+
+      - name: "Real mlx-community quant load + forward (not a stub)"
+        if: always()
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import mlx.core as mx
+          from mlx_lm import load
+          model, tok = load("mlx-community/SmolLM-135M-Instruct-4bit")
+          ids = mx.array([tok.encode("Unsloth makes finetuning fast")])
+          out = model(ids)
+          mx.eval(out)
+          print("REALQUANT class", type(model).__name__, "logits", out.shape, out.dtype)
+          print("REALQUANT device", mx.default_device(), "finite", bool(mx.isfinite(out).all()))
+          PY
+
+      - name: "tests/test_mlx_vlm_label_masks.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_vlm_label_masks.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_vlm_label_masks.py"
+          EXPECT_TOTAL = 54
+          ALLOWED_SKIPS = set()
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "tests/test_mlx_trainer_internals.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_trainer_internals.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_trainer_internals.py"
+          EXPECT_TOTAL = 151
+          ALLOWED_SKIPS = set()
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "tests/test_mlx_extra_special_tokens_compat.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_extra_special_tokens_compat.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_extra_special_tokens_compat.py"
+          EXPECT_TOTAL = 7
+          ALLOWED_SKIPS = set()
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "tests/test_mlx_batching_and_decay.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_batching_and_decay.py -v -rs --junitxml=report.xml \
+            --deselect tests/test_mlx_batching_and_decay.py::test_compiler_review_guards_are_present || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_batching_and_decay.py"
+          EXPECT_TOTAL = 10
+          ALLOWED_SKIPS = set()
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "tests/test_mlx_module_exports.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_module_exports.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_module_exports.py"
+          EXPECT_TOTAL = 19
+          ALLOWED_SKIPS = set()
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "tests/test_mlx_training_e2e_metal.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_training_e2e_metal.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_training_e2e_metal.py"
+          EXPECT_TOTAL = 19
+          ALLOWED_SKIPS = set()
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "tests/test_mlx_cpt_partition_metal.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_cpt_partition_metal.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_cpt_partition_metal.py"
+          EXPECT_TOTAL = 14
+          ALLOWED_SKIPS = set()
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "tests/test_mlx_ddp_metal.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_ddp_metal.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_ddp_metal.py"
+          EXPECT_TOTAL = 1
+          ALLOWED_SKIPS = set()
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "tests/test_mlx_qwen3_prompt_batch_isolated.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_qwen3_prompt_batch_isolated.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_qwen3_prompt_batch_isolated.py"
+          EXPECT_TOTAL = 1
+          ALLOWED_SKIPS = set()
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "952 04acb10c/9881849b: Qwen3-VL mixed batch parity + reused prompt cache"
+        if: always()
+        run: |
+          export PROBE_EXPECT_ZOO_ROOT=$GITHUB_WORKSPACE
+          python - <<'PY'
+          """PR 952 probe: Qwen3-VL mixed text/image batch generation on Apple Silicon.
+
+          Everything this PR fixes about Qwen3's visual window was measured only on MLX's CPU
+          backend on Linux. Nobody should claim mixed text/image batches generate correctly on
+          Apple Silicon until it runs there, which is what this probe is for.
+
+          It drives a REAL `mlx_vlm.models.qwen3_vl.Model` -- real config, real
+          `get_input_embeddings`, real `LanguageModel`, real attention and real deepstack merge.
+          Only the vision TOWER is stubbed, because the pixel encoder is not what this PR
+          changes and stubbing it makes each row's contribution identifiable by value.
+
+          The path under test is the shipped one, end to end:
+              per-request kwargs (mirroring mlx_vlm/server/generation.py::_gpu_embed)
+                -> mlx_vlm.generate.ar._merge_prefill_prompt_kwargs   (wrapped by the PR)
+                -> qwen3_vl LanguageModel.__call__                    (wrapped by the PR)
+                -> Qwen3VLModel._deepstack_process
+
+          METHOD. For every batch shape, each row is also prefilled ALONE, and the batched
+          logits for that row are compared against its solo logits. Max absolute deviation per
+          row is reported. A correct implementation gives 0.000000 for every row: batching must
+          not change what any single row generates.
+
+            PROBE-Q1  mixed [text, visual], equal prompt lengths
+            PROBE-Q2  all-visual batch (control: every row carries the key)
+            PROBE-Q3  unequal prompt lengths with REAL left padding
+            PROBE-Q4  three rows [text, visual, text]
+            PROBE-Q5  reused prompt cache -- the deepstack path, the other Metal-sensitive fix
+            PROBE-Q6  left-padded rows must not borrow a neighbour's features
+            PROBE-Q7  a cache that declares left_padding as None must not crash
+
+          Exit code 0 == every row of every batch matches its solo prefill exactly.
+
+          A/B validated on Linux CPU before staging against the pre-fix bodies of
+          _qwen3_visual_window / _qwen3_cache_offsets / _pad_qwen3_prompt_rows (see REPORT_952.md).
+          """
+          import importlib
+          import os
+          import sys
+          import types
+
+          import mlx.core as mx
+          import mlx.nn as nn
+
+          import unsloth_zoo
+
+          print("PROBE-Q unsloth_zoo from", unsloth_zoo.__file__)
+          _EXPECT_ROOT = os.environ.get("PROBE_EXPECT_ZOO_ROOT")
+          if _EXPECT_ROOT:
+              _actual = os.path.realpath(unsloth_zoo.__file__)
+              if not _actual.startswith(os.path.realpath(_EXPECT_ROOT) + os.sep):
+                  sys.exit(
+                      f"PROBE-Q FAIL: imported unsloth_zoo from {_actual}, "
+                      f"expected it under {_EXPECT_ROOT}"
+                  )
+
+          if "mlx_simulation" in str(getattr(mx, "__file__", "")):
+              sys.exit("PROBE-Q FAIL: mlx.core is the simulation stub, not the real runtime")
+          print("PROBE-Q device", mx.default_device())
+          try:
+              print("PROBE-Q metal", mx.metal.is_available())
+          except Exception as exc:  # pragma: no cover - platform dependent
+              print("PROBE-Q metal <unavailable>", type(exc).__name__)
+
+          import mlx_vlm  # noqa: E402
+
+          print("PROBE-Q mlx_vlm", mlx_vlm.__version__, mlx_vlm.__file__)
+
+          from mlx_vlm.models.qwen3_vl import qwen3_vl as q3  # noqa: E402
+          from mlx_vlm.models.qwen3_vl.config import (  # noqa: E402
+              ModelConfig,
+              TextConfig,
+              VisionConfig,
+          )
+          from mlx_lm.models import cache as mlx_cache  # noqa: E402
+
+          # `import mlx_vlm.generate.ar as ar` fails on some installs because the package-level
+          # __getattr__ resolves `ar` oddly; importlib is what the shipped installer uses too.
+          ar = importlib.import_module("mlx_vlm.generate.ar")
+          if not hasattr(ar, "_merge_prefill_prompt_kwargs"):
+              sys.exit("PROBE-Q FAIL: mlx-vlm has no _merge_prefill_prompt_kwargs to exercise")
+          if not hasattr(mlx_cache, "BatchKVCache"):
+              sys.exit("PROBE-Q FAIL: mlx-lm has no BatchKVCache, the left-padding path is unreachable")
+
+          import unsloth_zoo.mlx.compile as mc  # noqa: E402
+
+          mc._install_qwen3_family_compile_patches()
+          merged_fn = getattr(ar, "_merge_prefill_prompt_kwargs")
+          print(
+              "PROBE-Q patches installed:",
+              "prompt_merge_wrapped=", bool(getattr(merged_fn, "_unsloth_qwen3_prompt_merge", False)),
+              "language_call_wrapped=",
+              bool(
+                  getattr(
+                      importlib.import_module(
+                          "mlx_vlm.models.qwen3_vl.language"
+                      ).LanguageModel.__call__,
+                      "_unsloth_qwen3_visual_state",
+                      False,
+                  )
+              ),
+          )
+          if not getattr(merged_fn, "_unsloth_qwen3_prompt_merge", False):
+              sys.exit("PROBE-Q FAIL: the prompt-merge adapter is not installed; nothing under test")
+
+          HIDDEN, N_DEEPSTACK = 16, 2
+          TOL = 1e-4
+
+
+          class _StubVisionTower(nn.Module):
+              """Real shape contract, values that identify the row they came from."""
+
+              def __init__(self, hidden):
+                  super().__init__()
+                  self.hidden = hidden
+                  self.patch_embed = type(
+                      "P", (), {"proj": type("W", (), {"weight": mx.zeros((1,), dtype=mx.float32)})()}
+                  )()
+
+              def __call__(self, pixel_values, grid_thw):
+                  n = int(pixel_values.shape[0])
+                  base = float(pixel_values[0, 0].item())
+                  return (
+                      mx.full((n, self.hidden), base, dtype=mx.float32),
+                      [
+                          mx.full((n, self.hidden), base + 100.0 * (i + 1), dtype=mx.float32)
+                          for i in range(N_DEEPSTACK)
+                      ],
+                  )
+
+
+          def build_model():
+              text = TextConfig(
+                  model_type="qwen3_vl", num_hidden_layers=2, hidden_size=HIDDEN,
+                  intermediate_size=32, num_attention_heads=2, rms_norm_eps=1e-6,
+                  vocab_size=200, num_key_value_heads=1, head_dim=8, rope_theta=10000.0,
+                  max_position_embeddings=512,
+                  rope_scaling={"type": "default", "mrope_section": [2, 1, 1]},
+              )
+              vision = VisionConfig(
+                  depth=2, hidden_size=8, intermediate_size=16, out_hidden_size=HIDDEN,
+                  num_heads=2, patch_size=2, spatial_patch_size=2, spatial_merge_size=1,
+                  temporal_patch_size=2, deepstack_visual_indexes=[0, 1],
+              )
+              cfg = ModelConfig(
+                  text_config=text, vision_config=vision, model_type="qwen3_vl",
+                  image_token_id=5, video_token_id=6, vision_start_token_id=4, vocab_size=200,
+              )
+              m = q3.Model(cfg)
+              m.vision_tower = _StubVisionTower(HIDDEN)
+              m.eval()  # mlx_vlm.utils.load() does this; nn.Module.training defaults True
+              return m
+
+
+          def gpu_embed(model, ids, pixel_values=None, **data_kwargs):
+              """Faithful copy of mlx_vlm/server/generation.py::_gpu_embed kwargs assembly."""
+              embed = model.get_input_embeddings(
+                  mx.array([ids], dtype=mx.int32), pixel_values, mask=None, **data_kwargs
+              )
+              return {**data_kwargs, **{k: v for k, v in embed.to_dict().items() if v is not None}}
+
+
+          def run(lm, ids_rows, kwargs_list):
+              """Prefill one batch through the shipped merge + the patched language call."""
+              inputs_embeds, merged = ar._merge_prefill_prompt_kwargs(kwargs_list, ids_rows)
+              lengths = [len(r) for r in ids_rows]
+              max_len = max(lengths)
+              left_padding = [max_len - n for n in lengths]
+              padded_ids = [[0] * (max_len - len(r)) + r for r in ids_rows]
+              caches = [mlx_cache.BatchKVCache(left_padding=left_padding) for _ in range(2)]
+              call_kwargs = dict(merged)
+              call_kwargs.pop("inputs_embeds", None)
+              call_kwargs.pop("rope_deltas", None)
+              out = lm(
+                  mx.array(padded_ids, dtype=mx.int32), inputs_embeds=inputs_embeds,
+                  mask=None, cache=caches, **call_kwargs,
+              )
+              logits = out.logits if hasattr(out, "logits") else out
+              mx.eval(logits)
+              return logits
+
+
+          mx.random.seed(0)
+          model = build_model()
+          lm = model.language_model
+
+          VIS = [10, 4, 5, 5, 5, 20]          # vision_start(4) then three image tokens(5)
+          VIS2 = [11, 4, 5, 5, 5, 21]
+          SHORT_TEXT = [10, 11, 12]           # shorter -> REAL left padding in a mixed batch
+          LONG_TEXT = [10, 11, 12, 13, 14, 15]
+
+          PX1 = mx.full((3, 24), 7.0, dtype=mx.float32)
+          PX2 = mx.full((3, 24), 9.0, dtype=mx.float32)
+          GRID = mx.array([[1, 3, 1]], dtype=mx.int32)
+
+          kw_vis = gpu_embed(model, VIS, pixel_values=PX1, image_grid_thw=GRID)
+          kw_vis2 = gpu_embed(model, VIS2, pixel_values=PX2, image_grid_thw=GRID)
+          kw_short = gpu_embed(model, SHORT_TEXT)
+          kw_long = gpu_embed(model, LONG_TEXT)
+
+          print(
+              "PROBE-Q per-row kwargs: text row keys=",
+              sorted(kw_long), " visual row keys=", sorted(kw_vis),
+          )
+
+          alone_vis = run(lm, [VIS], [kw_vis])
+          alone_vis2 = run(lm, [VIS2], [kw_vis2])
+          alone_short = run(lm, [SHORT_TEXT], [kw_short])
+          alone_long = run(lm, [LONG_TEXT], [kw_long])
+
+          problems = []
+
+
+          def check(tag, label, ids_rows, kws, refs):
+              print(f"\n--- {tag} {label} ---")
+              try:
+                  out = run(lm, ids_rows, kws)
+              except Exception as exc:  # noqa: BLE001
+                  print(f"{tag} RAISED {type(exc).__name__}: {exc}")
+                  problems.append(f"{tag}: raised {type(exc).__name__}: {exc}")
+                  return
+              for i, ref in enumerate(refs):
+                  n = ref.shape[1]
+                  dev = float(mx.abs(out[i : i + 1, -n:, :] - ref).max().item())
+                  verdict = "CORRECT" if dev < TOL else "WRONG"
+                  print(f"{tag} row{i}: |batched - alone|_max = {dev:.6f} -> {verdict}")
+                  if dev >= TOL:
+                      problems.append(f"{tag} row{i}: deviation {dev:.6f}")
+
+
+          check("PROBE-Q1", "mixed [text(6), visual(6)] equal lengths",
+                [LONG_TEXT, VIS], [kw_long, kw_vis], [alone_long, alone_vis])
+
+          check("PROBE-Q2", "all-visual [visual(6), visual(6)]",
+                [VIS, VIS2], [kw_vis, kw_vis2], [alone_vis, alone_vis2])
+
+          check("PROBE-Q3", "unequal lengths [text(3), visual(6)] with real left padding",
+                [SHORT_TEXT, VIS], [kw_short, kw_vis], [alone_short, alone_vis])
+
+          check("PROBE-Q4", "three rows [text(6), visual(6), text(6)]",
+                [LONG_TEXT, VIS, LONG_TEXT], [kw_long, kw_vis, kw_long],
+                [alone_long, alone_vis, alone_long])
+
+          # ---- PROBE-Q5: reused prompt cache -- deepstack features must survive ----
+          # A second turn re-feeds a whole prompt whose mask already covers exactly the tokens
+          # being fed, while the cache offset carried over from the earlier turn is non-zero.
+          # Pre-fix that offset was applied to the FEATURE window as well, so once it reached
+          # the prompt length every deepstack embed was silently dropped.
+          print("\n--- PROBE-Q5 reused prompt cache, deepstack window ---")
+          masks = mx.array([[0, 0, 1, 1, 0, 0]], dtype=mx.bool_)
+          packed, positions = mc._pack_qwen3_visual_state(masks, [mx.array([[1.0], [2.0]])])
+          for carried in (0, 6, 20):
+              window_masks, window_embeds = mc._qwen3_visual_window(
+                  masks, packed, positions,
+                  mask_offsets=(carried,), feature_offsets=(carried,), window=6,
+              )
+              kept = int(window_embeds[0].shape[0])
+              print(
+                  f"PROBE-Q5 carried_cache_offset={carried:2d} deepstack_features_kept={kept} "
+                  f"mask={window_masks.tolist()} values={window_embeds[0].tolist()}"
+              )
+              if kept != 2 or window_embeds[0].tolist() != [[1.0], [2.0]]:
+                  problems.append(
+                      f"PROBE-Q5 offset={carried}: kept {kept} of 2 deepstack features "
+                      f"({window_embeds[0].tolist()})"
+                  )
+
+          # Same behaviour through the REAL installed adapter, with a cache that has advanced.
+          seen = {}
+
+
+          def _spy(self, inputs, inputs_embeds=None, mask=None, cache=None,
+                   visual_pos_masks=None, deepstack_visual_embeds=None, **kwargs):
+              seen["mask_width"] = None if visual_pos_masks is None else int(visual_pos_masks.shape[-1])
+              seen["per_layer"] = (
+                  None if deepstack_visual_embeds is None
+                  else [int(e.shape[0]) for e in deepstack_visual_embeds]
+              )
+              seen["leftover"] = sorted(kwargs)
+              return mx.zeros((1, int(inputs.shape[1]), 4))
+
+
+          adapted = mc._qwen3_visual_state_adapter(_spy)
+          for offset in (0, 6):
+              cache = [types.SimpleNamespace(offset=offset, left_padding=None)]
+              adapted(
+                  object(), mx.zeros((1, 6), dtype=mx.int32), cache=cache,
+                  visual_pos_masks=masks,
+                  **{
+                      mc._QWEN3_VISUAL_STATE_KEY: packed,
+                      mc._QWEN3_VISUAL_POSITIONS_KEY: positions,
+                  },
+              )
+              print(
+                  f"PROBE-Q5 adapter cache_offset={offset} mask_width={seen['mask_width']} "
+                  f"deepstack_per_layer={seen['per_layer']} unconsumed_kwargs={seen['leftover']}"
+              )
+              if seen["per_layer"] != [2]:
+                  problems.append(
+                      f"PROBE-Q5 adapter offset={offset}: deepstack per-layer {seen['per_layer']}, "
+                      "expected [2] -- the reused cache dropped the visual embeds"
+                  )
+              if seen["leftover"]:
+                  problems.append(
+                      f"PROBE-Q5 adapter offset={offset}: leaked kwargs {seen['leftover']} "
+                      "into the shipped language call"
+                  )
+
+          # ---- PROBE-Q6: left-padded rows must keep their own features ----
+          print("\n--- PROBE-Q6 left padding must not cross-contaminate rows ---")
+          pad_masks = mx.array([[0, 0, 0, 0, 1, 1], [1, 1, 0, 0, 0, 0]], dtype=mx.bool_)
+          pad_packed, pad_positions = mc._pack_qwen3_visual_state(
+              pad_masks, [mx.array([[1.0], [2.0], [3.0], [4.0]])]
+          )
+          pad_window_masks, pad_window_embeds = mc._qwen3_visual_window(
+              pad_masks, pad_packed, pad_positions,
+              mask_offsets=(0, 0), feature_offsets=(-3, 0), window=6,
+          )
+          got = pad_window_embeds[0].tolist()
+          print(f"PROBE-Q6 row0 left-padded by 3: features={got} expected=[[1.0], [2.0], [3.0], [4.0]]")
+          if got != [[1.0], [2.0], [3.0], [4.0]] or pad_window_masks.tolist() != pad_masks.tolist():
+              problems.append(f"PROBE-Q6: features {got}, a padded row borrowed its neighbour's")
+
+          # ---- PROBE-Q7: left_padding declared as None must not crash ----
+          print("\n--- PROBE-Q7 cache declaring left_padding=None ---")
+          try:
+              offsets = mc._qwen3_cache_offsets(
+                  [types.SimpleNamespace(offset=0, left_padding=None)], batch_size=1
+              )
+              print(f"PROBE-Q7 _qwen3_cache_offsets -> {offsets}")
+              if offsets != ((0,), (0,)):
+                  problems.append(f"PROBE-Q7: offsets {offsets}, expected ((0,), (0,))")
+          except Exception as exc:  # noqa: BLE001
+              print(f"PROBE-Q7 RAISED {type(exc).__name__}: {exc}")
+              problems.append(f"PROBE-Q7: raised {type(exc).__name__}: {exc}")
+
+          print()
+          if problems:
+              sys.exit("PROBE-Q FAIL: " + "; ".join(problems))
+          print("PROBE-Q ALL OK: every row of every batch matches its solo prefill exactly")
+          PY
+      - name: "952 cross-version (informational): the same probe on mlx-vlm 0.6.7"
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+          rc=0
+          python -c "import mlx_vlm; print('XVER before', mlx_vlm.__version__)"
+          pip install --quiet --no-deps 'mlx-vlm==0.6.7'
+          python -c "import mlx_vlm; print('XVER now', mlx_vlm.__version__)"
+          export PROBE_EXPECT_ZOO_ROOT=$GITHUB_WORKSPACE
+          python - <<'PY'
+          """PR 952 probe: Qwen3-VL mixed text/image batch generation on Apple Silicon.
+
+          Everything this PR fixes about Qwen3's visual window was measured only on MLX's CPU
+          backend on Linux. Nobody should claim mixed text/image batches generate correctly on
+          Apple Silicon until it runs there, which is what this probe is for.
+
+          It drives a REAL `mlx_vlm.models.qwen3_vl.Model` -- real config, real
+          `get_input_embeddings`, real `LanguageModel`, real attention and real deepstack merge.
+          Only the vision TOWER is stubbed, because the pixel encoder is not what this PR
+          changes and stubbing it makes each row's contribution identifiable by value.
+
+          The path under test is the shipped one, end to end:
+              per-request kwargs (mirroring mlx_vlm/server/generation.py::_gpu_embed)
+                -> mlx_vlm.generate.ar._merge_prefill_prompt_kwargs   (wrapped by the PR)
+                -> qwen3_vl LanguageModel.__call__                    (wrapped by the PR)
+                -> Qwen3VLModel._deepstack_process
+
+          METHOD. For every batch shape, each row is also prefilled ALONE, and the batched
+          logits for that row are compared against its solo logits. Max absolute deviation per
+          row is reported. A correct implementation gives 0.000000 for every row: batching must
+          not change what any single row generates.
+
+            PROBE-Q1  mixed [text, visual], equal prompt lengths
+            PROBE-Q2  all-visual batch (control: every row carries the key)
+            PROBE-Q3  unequal prompt lengths with REAL left padding
+            PROBE-Q4  three rows [text, visual, text]
+            PROBE-Q5  reused prompt cache -- the deepstack path, the other Metal-sensitive fix
+            PROBE-Q6  left-padded rows must not borrow a neighbour's features
+            PROBE-Q7  a cache that declares left_padding as None must not crash
+
+          Exit code 0 == every row of every batch matches its solo prefill exactly.
+
+          A/B validated on Linux CPU before staging against the pre-fix bodies of
+          _qwen3_visual_window / _qwen3_cache_offsets / _pad_qwen3_prompt_rows (see REPORT_952.md).
+          """
+          import importlib
+          import os
+          import sys
+          import types
+
+          import mlx.core as mx
+          import mlx.nn as nn
+
+          import unsloth_zoo
+
+          print("PROBE-Q unsloth_zoo from", unsloth_zoo.__file__)
+          _EXPECT_ROOT = os.environ.get("PROBE_EXPECT_ZOO_ROOT")
+          if _EXPECT_ROOT:
+              _actual = os.path.realpath(unsloth_zoo.__file__)
+              if not _actual.startswith(os.path.realpath(_EXPECT_ROOT) + os.sep):
+                  sys.exit(
+                      f"PROBE-Q FAIL: imported unsloth_zoo from {_actual}, "
+                      f"expected it under {_EXPECT_ROOT}"
+                  )
+
+          if "mlx_simulation" in str(getattr(mx, "__file__", "")):
+              sys.exit("PROBE-Q FAIL: mlx.core is the simulation stub, not the real runtime")
+          print("PROBE-Q device", mx.default_device())
+          try:
+              print("PROBE-Q metal", mx.metal.is_available())
+          except Exception as exc:  # pragma: no cover - platform dependent
+              print("PROBE-Q metal <unavailable>", type(exc).__name__)
+
+          import mlx_vlm  # noqa: E402
+
+          print("PROBE-Q mlx_vlm", mlx_vlm.__version__, mlx_vlm.__file__)
+
+          from mlx_vlm.models.qwen3_vl import qwen3_vl as q3  # noqa: E402
+          from mlx_vlm.models.qwen3_vl.config import (  # noqa: E402
+              ModelConfig,
+              TextConfig,
+              VisionConfig,
+          )
+          from mlx_lm.models import cache as mlx_cache  # noqa: E402
+
+          # `import mlx_vlm.generate.ar as ar` fails on some installs because the package-level
+          # __getattr__ resolves `ar` oddly; importlib is what the shipped installer uses too.
+          ar = importlib.import_module("mlx_vlm.generate.ar")
+          if not hasattr(ar, "_merge_prefill_prompt_kwargs"):
+              sys.exit("PROBE-Q FAIL: mlx-vlm has no _merge_prefill_prompt_kwargs to exercise")
+          if not hasattr(mlx_cache, "BatchKVCache"):
+              sys.exit("PROBE-Q FAIL: mlx-lm has no BatchKVCache, the left-padding path is unreachable")
+
+          import unsloth_zoo.mlx.compile as mc  # noqa: E402
+
+          mc._install_qwen3_family_compile_patches()
+          merged_fn = getattr(ar, "_merge_prefill_prompt_kwargs")
+          print(
+              "PROBE-Q patches installed:",
+              "prompt_merge_wrapped=", bool(getattr(merged_fn, "_unsloth_qwen3_prompt_merge", False)),
+              "language_call_wrapped=",
+              bool(
+                  getattr(
+                      importlib.import_module(
+                          "mlx_vlm.models.qwen3_vl.language"
+                      ).LanguageModel.__call__,
+                      "_unsloth_qwen3_visual_state",
+                      False,
+                  )
+              ),
+          )
+          if not getattr(merged_fn, "_unsloth_qwen3_prompt_merge", False):
+              sys.exit("PROBE-Q FAIL: the prompt-merge adapter is not installed; nothing under test")
+
+          HIDDEN, N_DEEPSTACK = 16, 2
+          TOL = 1e-4
+
+
+          class _StubVisionTower(nn.Module):
+              """Real shape contract, values that identify the row they came from."""
+
+              def __init__(self, hidden):
+                  super().__init__()
+                  self.hidden = hidden
+                  self.patch_embed = type(
+                      "P", (), {"proj": type("W", (), {"weight": mx.zeros((1,), dtype=mx.float32)})()}
+                  )()
+
+              def __call__(self, pixel_values, grid_thw):
+                  n = int(pixel_values.shape[0])
+                  base = float(pixel_values[0, 0].item())
+                  return (
+                      mx.full((n, self.hidden), base, dtype=mx.float32),
+                      [
+                          mx.full((n, self.hidden), base + 100.0 * (i + 1), dtype=mx.float32)
+                          for i in range(N_DEEPSTACK)
+                      ],
+                  )
+
+
+          def build_model():
+              text = TextConfig(
+                  model_type="qwen3_vl", num_hidden_layers=2, hidden_size=HIDDEN,
+                  intermediate_size=32, num_attention_heads=2, rms_norm_eps=1e-6,
+                  vocab_size=200, num_key_value_heads=1, head_dim=8, rope_theta=10000.0,
+                  max_position_embeddings=512,
+                  rope_scaling={"type": "default", "mrope_section": [2, 1, 1]},
+              )
+              vision = VisionConfig(
+                  depth=2, hidden_size=8, intermediate_size=16, out_hidden_size=HIDDEN,
+                  num_heads=2, patch_size=2, spatial_patch_size=2, spatial_merge_size=1,
+                  temporal_patch_size=2, deepstack_visual_indexes=[0, 1],
+              )
+              cfg = ModelConfig(
+                  text_config=text, vision_config=vision, model_type="qwen3_vl",
+                  image_token_id=5, video_token_id=6, vision_start_token_id=4, vocab_size=200,
+              )
+              m = q3.Model(cfg)
+              m.vision_tower = _StubVisionTower(HIDDEN)
+              m.eval()  # mlx_vlm.utils.load() does this; nn.Module.training defaults True
+              return m
+
+
+          def gpu_embed(model, ids, pixel_values=None, **data_kwargs):
+              """Faithful copy of mlx_vlm/server/generation.py::_gpu_embed kwargs assembly."""
+              embed = model.get_input_embeddings(
+                  mx.array([ids], dtype=mx.int32), pixel_values, mask=None, **data_kwargs
+              )
+              return {**data_kwargs, **{k: v for k, v in embed.to_dict().items() if v is not None}}
+
+
+          def run(lm, ids_rows, kwargs_list):
+              """Prefill one batch through the shipped merge + the patched language call."""
+              inputs_embeds, merged = ar._merge_prefill_prompt_kwargs(kwargs_list, ids_rows)
+              lengths = [len(r) for r in ids_rows]
+              max_len = max(lengths)
+              left_padding = [max_len - n for n in lengths]
+              padded_ids = [[0] * (max_len - len(r)) + r for r in ids_rows]
+              caches = [mlx_cache.BatchKVCache(left_padding=left_padding) for _ in range(2)]
+              call_kwargs = dict(merged)
+              call_kwargs.pop("inputs_embeds", None)
+              call_kwargs.pop("rope_deltas", None)
+              out = lm(
+                  mx.array(padded_ids, dtype=mx.int32), inputs_embeds=inputs_embeds,
+                  mask=None, cache=caches, **call_kwargs,
+              )
+              logits = out.logits if hasattr(out, "logits") else out
+              mx.eval(logits)
+              return logits
+
+
+          mx.random.seed(0)
+          model = build_model()
+          lm = model.language_model
+
+          VIS = [10, 4, 5, 5, 5, 20]          # vision_start(4) then three image tokens(5)
+          VIS2 = [11, 4, 5, 5, 5, 21]
+          SHORT_TEXT = [10, 11, 12]           # shorter -> REAL left padding in a mixed batch
+          LONG_TEXT = [10, 11, 12, 13, 14, 15]
+
+          PX1 = mx.full((3, 24), 7.0, dtype=mx.float32)
+          PX2 = mx.full((3, 24), 9.0, dtype=mx.float32)
+          GRID = mx.array([[1, 3, 1]], dtype=mx.int32)
+
+          kw_vis = gpu_embed(model, VIS, pixel_values=PX1, image_grid_thw=GRID)
+          kw_vis2 = gpu_embed(model, VIS2, pixel_values=PX2, image_grid_thw=GRID)
+          kw_short = gpu_embed(model, SHORT_TEXT)
+          kw_long = gpu_embed(model, LONG_TEXT)
+
+          print(
+              "PROBE-Q per-row kwargs: text row keys=",
+              sorted(kw_long), " visual row keys=", sorted(kw_vis),
+          )
+
+          alone_vis = run(lm, [VIS], [kw_vis])
+          alone_vis2 = run(lm, [VIS2], [kw_vis2])
+          alone_short = run(lm, [SHORT_TEXT], [kw_short])
+          alone_long = run(lm, [LONG_TEXT], [kw_long])
+
+          problems = []
+
+
+          def check(tag, label, ids_rows, kws, refs):
+              print(f"\n--- {tag} {label} ---")
+              try:
+                  out = run(lm, ids_rows, kws)
+              except Exception as exc:  # noqa: BLE001
+                  print(f"{tag} RAISED {type(exc).__name__}: {exc}")
+                  problems.append(f"{tag}: raised {type(exc).__name__}: {exc}")
+                  return
+              for i, ref in enumerate(refs):
+                  n = ref.shape[1]
+                  dev = float(mx.abs(out[i : i + 1, -n:, :] - ref).max().item())
+                  verdict = "CORRECT" if dev < TOL else "WRONG"
+                  print(f"{tag} row{i}: |batched - alone|_max = {dev:.6f} -> {verdict}")
+                  if dev >= TOL:
+                      problems.append(f"{tag} row{i}: deviation {dev:.6f}")
+
+
+          check("PROBE-Q1", "mixed [text(6), visual(6)] equal lengths",
+                [LONG_TEXT, VIS], [kw_long, kw_vis], [alone_long, alone_vis])
+
+          check("PROBE-Q2", "all-visual [visual(6), visual(6)]",
+                [VIS, VIS2], [kw_vis, kw_vis2], [alone_vis, alone_vis2])
+
+          check("PROBE-Q3", "unequal lengths [text(3), visual(6)] with real left padding",
+                [SHORT_TEXT, VIS], [kw_short, kw_vis], [alone_short, alone_vis])
+
+          check("PROBE-Q4", "three rows [text(6), visual(6), text(6)]",
+                [LONG_TEXT, VIS, LONG_TEXT], [kw_long, kw_vis, kw_long],
+                [alone_long, alone_vis, alone_long])
+
+          # ---- PROBE-Q5: reused prompt cache -- deepstack features must survive ----
+          # A second turn re-feeds a whole prompt whose mask already covers exactly the tokens
+          # being fed, while the cache offset carried over from the earlier turn is non-zero.
+          # Pre-fix that offset was applied to the FEATURE window as well, so once it reached
+          # the prompt length every deepstack embed was silently dropped.
+          print("\n--- PROBE-Q5 reused prompt cache, deepstack window ---")
+          masks = mx.array([[0, 0, 1, 1, 0, 0]], dtype=mx.bool_)
+          packed, positions = mc._pack_qwen3_visual_state(masks, [mx.array([[1.0], [2.0]])])
+          for carried in (0, 6, 20):
+              window_masks, window_embeds = mc._qwen3_visual_window(
+                  masks, packed, positions,
+                  mask_offsets=(carried,), feature_offsets=(carried,), window=6,
+              )
+              kept = int(window_embeds[0].shape[0])
+              print(
+                  f"PROBE-Q5 carried_cache_offset={carried:2d} deepstack_features_kept={kept} "
+                  f"mask={window_masks.tolist()} values={window_embeds[0].tolist()}"
+              )
+              if kept != 2 or window_embeds[0].tolist() != [[1.0], [2.0]]:
+                  problems.append(
+                      f"PROBE-Q5 offset={carried}: kept {kept} of 2 deepstack features "
+                      f"({window_embeds[0].tolist()})"
+                  )
+
+          # Same behaviour through the REAL installed adapter, with a cache that has advanced.
+          seen = {}
+
+
+          def _spy(self, inputs, inputs_embeds=None, mask=None, cache=None,
+                   visual_pos_masks=None, deepstack_visual_embeds=None, **kwargs):
+              seen["mask_width"] = None if visual_pos_masks is None else int(visual_pos_masks.shape[-1])
+              seen["per_layer"] = (
+                  None if deepstack_visual_embeds is None
+                  else [int(e.shape[0]) for e in deepstack_visual_embeds]
+              )
+              seen["leftover"] = sorted(kwargs)
+              return mx.zeros((1, int(inputs.shape[1]), 4))
+
+
+          adapted = mc._qwen3_visual_state_adapter(_spy)
+          for offset in (0, 6):
+              cache = [types.SimpleNamespace(offset=offset, left_padding=None)]
+              adapted(
+                  object(), mx.zeros((1, 6), dtype=mx.int32), cache=cache,
+                  visual_pos_masks=masks,
+                  **{
+                      mc._QWEN3_VISUAL_STATE_KEY: packed,
+                      mc._QWEN3_VISUAL_POSITIONS_KEY: positions,
+                  },
+              )
+              print(
+                  f"PROBE-Q5 adapter cache_offset={offset} mask_width={seen['mask_width']} "
+                  f"deepstack_per_layer={seen['per_layer']} unconsumed_kwargs={seen['leftover']}"
+              )
+              if seen["per_layer"] != [2]:
+                  problems.append(
+                      f"PROBE-Q5 adapter offset={offset}: deepstack per-layer {seen['per_layer']}, "
+                      "expected [2] -- the reused cache dropped the visual embeds"
+                  )
+              if seen["leftover"]:
+                  problems.append(
+                      f"PROBE-Q5 adapter offset={offset}: leaked kwargs {seen['leftover']} "
+                      "into the shipped language call"
+                  )
+
+          # ---- PROBE-Q6: left-padded rows must keep their own features ----
+          print("\n--- PROBE-Q6 left padding must not cross-contaminate rows ---")
+          pad_masks = mx.array([[0, 0, 0, 0, 1, 1], [1, 1, 0, 0, 0, 0]], dtype=mx.bool_)
+          pad_packed, pad_positions = mc._pack_qwen3_visual_state(
+              pad_masks, [mx.array([[1.0], [2.0], [3.0], [4.0]])]
+          )
+          pad_window_masks, pad_window_embeds = mc._qwen3_visual_window(
+              pad_masks, pad_packed, pad_positions,
+              mask_offsets=(0, 0), feature_offsets=(-3, 0), window=6,
+          )
+          got = pad_window_embeds[0].tolist()
+          print(f"PROBE-Q6 row0 left-padded by 3: features={got} expected=[[1.0], [2.0], [3.0], [4.0]]")
+          if got != [[1.0], [2.0], [3.0], [4.0]] or pad_window_masks.tolist() != pad_masks.tolist():
+              problems.append(f"PROBE-Q6: features {got}, a padded row borrowed its neighbour's")
+
+          # ---- PROBE-Q7: left_padding declared as None must not crash ----
+          print("\n--- PROBE-Q7 cache declaring left_padding=None ---")
+          try:
+              offsets = mc._qwen3_cache_offsets(
+                  [types.SimpleNamespace(offset=0, left_padding=None)], batch_size=1
+              )
+              print(f"PROBE-Q7 _qwen3_cache_offsets -> {offsets}")
+              if offsets != ((0,), (0,)):
+                  problems.append(f"PROBE-Q7: offsets {offsets}, expected ((0,), (0,))")
+          except Exception as exc:  # noqa: BLE001
+              print(f"PROBE-Q7 RAISED {type(exc).__name__}: {exc}")
+              problems.append(f"PROBE-Q7: raised {type(exc).__name__}: {exc}")
+
+          print()
+          if problems:
+              sys.exit("PROBE-Q FAIL: " + "; ".join(problems))
+          print("PROBE-Q ALL OK: every row of every batch matches its solo prefill exactly")
+          PY
+          rc=$?
+          pip install --quiet --no-deps 'mlx-vlm==0.6.4'
+          python -c "import mlx_vlm; print('XVER restored', mlx_vlm.__version__)"
+          echo "XVER probe exit $rc"
+          exit $rc
+
+      - name: "Remaining tests/test_mlx*.py sweep (known red on upstream main, excluded from the pass/fail verdict)"
+        if: always()
+        continue-on-error: true
+        run: |
+          strict="tests/test_mlx_vlm_label_masks.py tests/test_mlx_trainer_internals.py tests/test_mlx_extra_special_tokens_compat.py tests/test_mlx_batching_and_decay.py tests/test_mlx_module_exports.py tests/test_mlx_training_e2e_metal.py tests/test_mlx_cpt_partition_metal.py tests/test_mlx_ddp_metal.py tests/test_mlx_qwen3_prompt_batch_isolated.py"
+          rc=0
+          for f in tests/test_mlx*.py; do
+            case " $strict " in *" $f "*) echo "SWEEP-SKIP $f (covered by a strict step)"; continue ;; esac
+            echo "::group::$f"
+            python -m pytest "$f" -q -rs \
+              --deselect tests/test_mlx_batching_and_decay.py::test_compiler_review_guards_are_present \
+              || { echo "SWEEP-RED $f"; rc=1; }
+            echo "::endgroup::"
+          done
+          echo "SWEEP-EXIT $rc (informational only; the strict steps above are the verdict)"
