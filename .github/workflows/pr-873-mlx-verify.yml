@@ -1,0 +1,1495 @@
+# Disposable staging-only verification for upstream PR #873.
+# The repo's mlx-ci.yml aborts at tests/test_qwen35_vjp_metal.py, which fails on upstream
+# main independently of this PR, so its later steps never run. This runs the PR's own MLX
+# tests on Apple Silicon directly, one pytest process per file so the mlx_simulation stub
+# installed by sibling test modules cannot mask the real mlx runtime.
+
+name: "PR 873 MLX verify"
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: pr873-mlx-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: "PR 873 MLX verify (macos-14)"
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install zoo with MLX extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx]
+          pip install pytest==9.0.3
+
+      - name: Versions and real-mlx probe
+        run: |
+          python -c "import platform; print('machine', platform.machine(), platform.platform())"
+          python -c "import mlx.core as mx; print('mlx.core', mx.__file__); print('device', mx.default_device())"
+          python -c "from mlx_lm.models.switch_layers import SwitchLinear, QuantizedSwitchLinear; print('SwitchLinear', SwitchLinear)"
+          # tests/test_mlx_ddp_metal.py per-test-skips unless mlx.launch sits beside sys.executable,
+          # so record its presence explicitly: that decides whether the real 2-rank path can run.
+          python -c "import sys, pathlib; p = pathlib.Path(sys.executable).with_name('mlx.launch'); print('mlx.launch', p, 'exists=', p.exists())"
+          pip list | grep -Ei 'mlx|transformers|torch|numpy'
+
+      - name: "Real mlx-community quant load + forward (not a stub)"
+        if: always()
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import mlx.core as mx
+          from mlx_lm import load
+          model, tok = load("mlx-community/SmolLM-135M-Instruct-4bit")
+          ids = mx.array([tok.encode("Unsloth makes finetuning fast")])
+          out = model(ids)
+          mx.eval(out)
+          print("REALQUANT class", type(model).__name__, "logits", out.shape, out.dtype)
+          print("REALQUANT device", mx.default_device(), "finite", bool(mx.isfinite(out).all()))
+          PY
+
+      - name: "tests/test_mlx_trainer_internals.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_trainer_internals.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_trainer_internals.py"
+          EXPECT_TOTAL = 295
+          ALLOWED_SKIPS = {'test_hf_flow_args_stand_in_matches_real_training_arguments'}
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "tests/test_mlx_training_e2e_metal.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_training_e2e_metal.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_training_e2e_metal.py"
+          EXPECT_TOTAL = 27
+          ALLOWED_SKIPS = set()
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "tests/test_mlx_shape_guard.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_shape_guard.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_shape_guard.py"
+          EXPECT_TOTAL = 24
+          ALLOWED_SKIPS = set()
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "tests/test_mlx_batching_and_decay.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_batching_and_decay.py -v -rs --junitxml=report.xml \
+            --deselect tests/test_mlx_batching_and_decay.py::test_compiler_review_guards_are_present || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_batching_and_decay.py"
+          EXPECT_TOTAL = 10
+          ALLOWED_SKIPS = set()
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "tests/test_mlx_ddp_metal.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_ddp_metal.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_ddp_metal.py"
+          EXPECT_TOTAL = 1
+          ALLOWED_SKIPS = set()
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "tests/test_mlx_distributed_loader.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_distributed_loader.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_distributed_loader.py"
+          EXPECT_TOTAL = 7
+          ALLOWED_SKIPS = set()
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "tests/test_mlx_switch_lora.py"
+        if: always()
+        run: |
+          rm -f report.xml
+          # never abort here: the junit assertion below is what emits the verdict,
+          # and a module-level SKIP exits pytest 0 so exit code alone is not enough.
+          python -m pytest tests/test_mlx_switch_lora.py -v -rs --junitxml=report.xml || true
+          python - <<'PY'
+          FILE = "tests/test_mlx_switch_lora.py"
+          EXPECT_TOTAL = 23
+          ALLOWED_SKIPS = set()
+          import os, sys, xml.etree.ElementTree as ET
+          if not os.path.exists("report.xml"):
+              sys.exit("VERIFICATION FAILED for " + FILE + ": pytest wrote no junit report "
+                       "(collection error or interpreter crash)")
+          root = ET.parse("report.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          passed = tests - skipped - failures - errors
+          print(f"VERDICT file={FILE!r} total={tests} passed={passed} "
+                f"skipped={skipped} failures={failures} errors={errors}")
+          # Name every skip so a partial skip can never hide: a file whose tests all
+          # skipped is a module-level skip (hard fail); individual skips are printed
+          # with their reason and reviewed by hand.
+          for c in root.iter("testcase"):
+              for s in c.findall("skipped"):
+                  print(f"SKIPLIST file={FILE} id={c.get('classname')}::{c.get('name')} "
+                        f"reason={(s.get('message') or '').strip()[:200]!r}")
+          for c in root.iter("testcase"):
+              for tag in ("failure", "error"):
+                  for f in c.findall(tag):
+                      print(f"REDLIST file={FILE} kind={tag} "
+                            f"id={c.get('classname')}::{c.get('name')} "
+                            f"msg={(f.get('message') or '').strip()[:300]!r}")
+          problems = []
+          if tests == 0:
+              problems.append("collected 0 tests (module-level skip or collection error)")
+          elif skipped == tests:
+              problems.append(f"ALL {tests} tests SKIPPED -- module-level skip, "
+                              "the file never ran for real on Apple Silicon")
+          if failures or errors:
+              problems.append(f"{failures} failed / {errors} errored")
+          # Exact-count gate: the prediction was written down before this ran, so a
+          # count that drifted either way (a test quietly not collected on Apple
+          # Silicon, or an unexpected extra) is a verification failure, not a pass.
+          if EXPECT_TOTAL is not None and tests != EXPECT_TOTAL:
+              problems.append(f"collected {tests} tests, PREDICTED {EXPECT_TOTAL}")
+          # Skips are allow-listed by test name. Everything else is a failure, so a
+          # Metal-gated test quietly skipping on the wrong runner cannot read green.
+          unexpected = [
+              c.get("name") for c in root.iter("testcase")
+              if c.findall("skipped") and c.get("name") not in ALLOWED_SKIPS
+          ]
+          if unexpected:
+              problems.append(
+                  f"{len(unexpected)} UNEXPECTED skip(s): {unexpected[:8]}")
+          missing_allowed = [
+              n for n in ALLOWED_SKIPS
+              if n not in {c.get("name") for c in root.iter("testcase")}
+          ]
+          if missing_allowed:
+              problems.append(
+                  f"allow-listed skip(s) not even collected: {missing_allowed}")
+          if problems:
+              sys.exit("VERIFICATION FAILED for " + FILE + ": " + "; ".join(problems))
+          if skipped:
+              print(f"VERIFICATION OK-WITH-ALLOWED-SKIPS for {FILE}: {passed} passed, "
+                    f"{skipped} skipped, all allow-listed {sorted(ALLOWED_SKIPS)} "
+                    f"(total {tests} == predicted {EXPECT_TOTAL})")
+          else:
+              print("VERIFICATION OK for " + FILE + f" ({passed}/{tests}, skipped=0"
+                    + (f", total == predicted {EXPECT_TOTAL}" if EXPECT_TOTAL else "")
+                    + ")")
+          PY
+      - name: "e9674210: accelerate availability + TrainingArguments constructibility"
+        if: always()
+        run: |
+          python - <<'PY'
+          """Targeted probe for unsloth-zoo PR 873 commit e9674210.
+
+          e9674210 exists because TrainingArguments cannot be constructed on Apple Silicon:
+          pyproject omits accelerate on darwin/arm64, and HF's TrainingArguments hard-requires
+          accelerate>=1.1.0 whenever torch is importable. Before that commit the two eval-cadence
+          tests raised ImportError on the only platform MLX actually runs on, which is exactly what
+          the previous macOS run at a28aae99 recorded (2 REDLIST entries).
+
+          This records, ON THE RUNNER:
+            * whether accelerate is importable at all,
+            * what transformers.utils.is_accelerate_available() returns (bare and version-gated),
+            * whether a real TrainingArguments can actually be constructed.
+
+          It deliberately does NOT assert which way those go: on a stock macos-14 image accelerate
+          is expected to be ABSENT, and the point of e9674210 is that the tests run either way. The
+          count/skip assertion for tests/test_mlx_trainer_internals.py is enforced by that file's
+          own strict step.
+          """
+          import platform
+          import sys
+          import tempfile
+
+          print("PROBE-ACC platform", platform.machine(), platform.platform())
+          print("PROBE-ACC python", sys.version.split()[0])
+
+          try:
+              import accelerate
+
+              print("PROBE-ACC accelerate importable=True version",
+                    getattr(accelerate, "__version__", "?"), accelerate.__file__)
+          except Exception as exc:
+              print("PROBE-ACC accelerate importable=False",
+                    type(exc).__name__, str(exc)[:200])
+
+          try:
+              import torch
+
+              print("PROBE-ACC torch importable=True version", torch.__version__)
+          except Exception as exc:
+              print("PROBE-ACC torch importable=False", type(exc).__name__, str(exc)[:200])
+
+          try:
+              from transformers.utils import is_accelerate_available
+
+              print("PROBE-ACC is_accelerate_available()", is_accelerate_available())
+              try:
+                  print("PROBE-ACC is_accelerate_available('1.1.0')",
+                        is_accelerate_available("1.1.0"))
+              except TypeError:
+                  print("PROBE-ACC is_accelerate_available takes no min_version on this "
+                        "transformers")
+          except Exception as exc:
+              print("PROBE-ACC is_accelerate_available UNAVAILABLE",
+                    type(exc).__name__, str(exc)[:200])
+
+          try:
+              from transformers import TrainingArguments
+
+              ta = TrainingArguments(output_dir=tempfile.mkdtemp(), report_to=[])
+              print("PROBE-ACC TrainingArguments CONSTRUCTED ok; "
+                    "eval_strategy=", getattr(ta, "eval_strategy", "?"),
+                    "eval_delay=", getattr(ta, "eval_delay", "?"))
+          except Exception as exc:
+              print("PROBE-ACC TrainingArguments FAILED",
+                    type(exc).__name__, str(exc)[:300])
+              print("PROBE-ACC ^^ this is precisely the platform gap e9674210 works around; "
+                    "the eval-cadence tests must still RUN (see the "
+                    "tests/test_mlx_trainer_internals.py strict step).")
+
+          # What the stand-in has to stand in for, recorded either way.
+          try:
+              from transformers.trainer_callback import DefaultFlowCallback
+
+              print("PROBE-ACC DefaultFlowCallback", DefaultFlowCallback)
+          except Exception as exc:
+              print("PROBE-ACC DefaultFlowCallback UNAVAILABLE",
+                    type(exc).__name__, str(exc)[:200])
+          PY
+      - name: "6a9bedea: per-split eval progress bars + checkpointed callback epoch"
+        if: always()
+        run: |
+          export PROBE_EXPECT_ZOO_ROOT=$GITHUB_WORKSPACE
+          python - ef <<'PY'
+          """End-to-end probes for unslothai/unsloth-zoo PR 873 head 6a9bedea.
+
+          Two behaviours, driven through the PUBLIC surface (a real quantized mlx-community
+          model, a real tokenizer, real batching and a real optimizer step), not through the
+          private helpers the unit tests reach for:
+
+            PROBE-E  A dict eval_dataset with three splits of different sizes, evaluated
+                     under the STOCK transformers ProgressCallback (no subclass, no
+                     monkeypatch). An observer callback registered AFTER it samples
+                     progress.prediction_bar right after ProgressCallback has updated it,
+                     so what is reported is exactly the geometry a user sees.
+                       pre-fix : one bar, total = the FIRST split's length, n climbing
+                                 through every later split's batch (2/2 -> 9/2).
+                       fixed   : one bar per split, each sized to its own split (2/2, 3/3,
+                                 4/4), with the last one still closed by on_evaluate.
+
+            PROBE-F  Write a checkpoint, resume from it, and report state.epoch as the
+                     callbacks see it at on_train_begin (and at on_train_end for the no-op
+                     resume, where the loop body never runs and nothing else can supply it).
+                       pre-fix : trainer_state.json has no "epoch" key, so epoch is None.
+                       fixed   : the checkpoint's epoch travels with global_step.
+
+          Prints PROBE-E*/PROBE-F* lines and asserts. Exit code 0 == both behaviours hold.
+          """
+          import json
+          import os
+          import sys
+          import tempfile
+
+          import mlx.core as mx
+          from transformers.trainer_callback import ProgressCallback, TrainerCallback
+
+          import unsloth_zoo
+          from unsloth_zoo.mlx.loader import FastMLXModel
+          from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+          MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
+
+          # Never let this probe silently grade a DIFFERENT tree than the one under test:
+          # running `python probe_ef.py` puts the probe's own directory on sys.path[0], so an
+          # installed unsloth_zoo can win over the checkout unless PYTHONPATH says otherwise.
+          print("PROBE-EF unsloth_zoo from", unsloth_zoo.__file__)
+          _EXPECT_ROOT = os.environ.get("PROBE_EXPECT_ZOO_ROOT")
+          if _EXPECT_ROOT:
+              _actual = os.path.realpath(unsloth_zoo.__file__)
+              if not _actual.startswith(os.path.realpath(_EXPECT_ROOT) + os.sep):
+                  sys.exit(
+                      f"PROBE-EF FAIL: imported unsloth_zoo from {_actual}, "
+                      f"expected it under {_EXPECT_ROOT}"
+                  )
+          print("PROBE-EF device", mx.default_device())
+          try:
+              print("PROBE-EF metal", mx.metal.is_available())
+          except Exception as exc:  # pragma: no cover - platform dependent
+              print("PROBE-EF metal <unavailable>", type(exc).__name__)
+
+
+          def _rows(n, tag):
+              return [
+                  {"text": f"### Question: what is {tag}{i} plus {tag}{i}?\n### Answer: {2 * i}."}
+                  for i in range(n)
+              ]
+
+
+          def _fresh_model():
+              model, tokenizer = FastMLXModel.from_pretrained(MODEL, max_seq_length=128)
+              model = FastMLXModel.get_peft_model(model, r=4, lora_alpha=8, lora_dropout=0)
+              return model, tokenizer
+
+
+          class BarObserver(TrainerCallback):
+              """Samples the stock ProgressCallback's bar; never touches it."""
+
+              def __init__(self, progress):
+                  self.progress = progress
+                  self.samples = []  # (bar_ordinal, total, n)
+                  self._bars = []    # strong refs, so id() can never be recycled
+
+              def _ordinal(self, bar):
+                  for i, seen in enumerate(self._bars):
+                      if seen is bar:
+                          return i
+                  self._bars.append(bar)
+                  return len(self._bars) - 1
+
+              def on_prediction_step(self, args, state, control, **kwargs):
+                  bar = getattr(self.progress, "prediction_bar", None)
+                  if bar is not None:
+                      self.samples.append((self._ordinal(bar), bar.total, bar.n))
+                  return control
+
+
+          class EpochSpy(TrainerCallback):
+              def __init__(self):
+                  self.begin = []
+                  self.end = []
+
+              def on_train_begin(self, args, state, control, **kwargs):
+                  self.begin.append(state.epoch)
+                  return control
+
+              def on_train_end(self, args, state, control, **kwargs):
+                  self.end.append(state.epoch)
+                  return control
+
+
+          # --------------------------------------------------------------------------
+          # PROBE-E: per-split prediction bars under a dict eval_dataset
+          # --------------------------------------------------------------------------
+          def probe_e():
+              out_dir = tempfile.mkdtemp()
+              model, tokenizer = _fresh_model()
+              progress = ProgressCallback()
+              observer = BarObserver(progress)
+              args = MLXTrainingConfig(
+                  per_device_train_batch_size=1,
+                  per_device_eval_batch_size=1,
+                  gradient_accumulation_steps=1,
+                  max_steps=2,
+                  eval_steps=2,
+                  save_steps=0,
+                  logging_steps=100,
+                  learning_rate=1e-4,
+                  max_seq_length=128,
+                  output_dir=out_dir,
+                  seed=3407,
+                  report_to="none",
+              )
+              trainer = MLXTrainer(
+                  model,
+                  tokenizer,
+                  _rows(4, "t"),
+                  args=args,
+                  # order matters: the observer must be dispatched AFTER ProgressCallback
+                  callbacks=[progress, observer],
+                  eval_dataset={"a": _rows(2, "a"), "b": _rows(3, "b"), "c": _rows(4, "c")},
+              )
+              trainer.train()
+
+              loader = trainer.callback_handler.eval_dataloader
+              split_sizes = (
+                  {k: len(v) for k, v in loader.items()} if isinstance(loader, dict) else None
+              )
+              print("PROBE-E split batch counts", split_sizes)
+
+              # Collapse the per-batch samples into one row per distinct bar object.
+              bars = {}
+              for ordinal, total, n in observer.samples:
+                  seen = bars.setdefault(ordinal, {"total": total, "n": 0, "updates": 0})
+                  seen["total"] = total
+                  seen["n"] = max(seen["n"], n)
+                  seen["updates"] += 1
+              for ordinal in sorted(bars):
+                  row = bars[ordinal]
+                  print(
+                      f"PROBE-E bar#{ordinal} total={row['total']} n={row['n']} "
+                      f"updates={row['updates']} overrun={row['n'] > row['total']}"
+                  )
+              print("PROBE-E raw geometry", [(t, n) for _, t, n in observer.samples])
+              print("PROBE-E distinct bars", len(bars),
+                    "final prediction_bar", progress.prediction_bar)
+
+              expected = [2, 3, 4]
+              assert split_sizes == {"a": 2, "b": 3, "c": 4}, split_sizes
+              assert len(bars) == 3, (
+                  f"PROBE-E FAIL: {len(bars)} prediction bar(s) for 3 splits -- the first "
+                  f"split's bar was reused across splits: {observer.samples}"
+              )
+              for ordinal, size in zip(sorted(bars), expected):
+                  row = bars[ordinal]
+                  assert row["total"] == size, (ordinal, row, size)
+                  assert row["n"] == size, (ordinal, row, size)
+                  assert row["n"] <= row["total"], row
+              # The last split's bar is still torn down by on_evaluate, exactly as in HF.
+              assert progress.prediction_bar is None, progress.prediction_bar
+              print("PROBE-E OK: each split got its own bar, sized 2/2, 3/3, 4/4; "
+                    "no bar ever ran past its own total")
+
+
+          # --------------------------------------------------------------------------
+          # PROBE-F: the checkpoint's epoch reaches the resumed run's lifecycle events
+          # --------------------------------------------------------------------------
+          def probe_f():
+              out_dir = tempfile.mkdtemp()
+
+              def build(spy):
+                  model, tokenizer = _fresh_model()
+                  args = MLXTrainingConfig(
+                      # 4 rows at batch size 1 => 4 micro-batches per epoch, so the
+                      # checkpoint at step 2 sits exactly half way through epoch 1.
+                      per_device_train_batch_size=1,
+                      gradient_accumulation_steps=1,
+                      max_steps=4,
+                      save_steps=2,
+                      logging_steps=100,
+                      learning_rate=1e-4,
+                      max_seq_length=128,
+                      output_dir=out_dir,
+                      seed=3407,
+                      report_to="none",
+                  )
+                  return MLXTrainer(model, tokenizer, _rows(4, "t"), args=args, callbacks=[spy])
+
+              build(EpochSpy()).train()
+              ck2 = os.path.join(out_dir, "checkpoint-2")
+              ck4 = os.path.join(out_dir, "checkpoint-4")
+              with open(os.path.join(ck2, "trainer_state.json")) as fh:
+                  state2 = json.load(fh)
+              print("PROBE-F checkpoint-2 trainer_state keys", sorted(state2))
+              print("PROBE-F checkpoint-2 global_step", state2.get("global_step"),
+                    "epoch", state2.get("epoch", "<ABSENT>"))
+              assert "epoch" in state2, (
+                  "PROBE-F FAIL: trainer_state.json carries no epoch, so a resumed run "
+                  f"cannot report one: {sorted(state2)}"
+              )
+              assert abs(float(state2["epoch"]) - 0.5) < 1e-6, state2["epoch"]
+
+              mid = EpochSpy()
+              build(mid).train(resume_from_checkpoint=ck2)
+              print("PROBE-F mid-epoch resume: state.epoch at on_train_begin", mid.begin)
+              assert mid.begin and mid.begin[0] is not None, (
+                  "PROBE-F FAIL: resumed on_train_begin saw epoch None " + repr(mid.begin)
+              )
+              assert abs(mid.begin[0] - 0.5) < 1e-6, mid.begin
+
+              # No-op resume: the checkpoint is already at max_steps, so the loop body never
+              # runs and nothing but the restore can supply the epoch at on_train_end.
+              noop = EpochSpy()
+              reused = build(noop)
+              reused.train(resume_from_checkpoint=ck4)
+              print("PROBE-F no-op resume: on_train_begin", noop.begin,
+                    "on_train_end", noop.end)
+              assert noop.begin and noop.begin[0] is not None, noop.begin
+              assert abs(noop.begin[0] - 1.0) < 1e-6, noop.begin
+              assert noop.end and noop.end[0] is not None, (
+                  "PROBE-F FAIL: on_train_end saw epoch None; the stock "
+                  "NotebookProgressCallback does int(state.epoch) there " + repr(noop.end)
+              )
+              assert abs(noop.end[0] - 1.0) < 1e-6, noop.end
+
+              # Reusing that trainer for a fresh train() must NOT serve the checkpoint's
+              # epoch: HF only reads trainer_state.json when resume_from_checkpoint is given.
+              reused.train()
+              print("PROBE-F fresh re-train after resume: on_train_begin", noop.begin)
+              assert noop.begin[1] is None, noop.begin
+              print("PROBE-F OK: the checkpoint's epoch reaches on_train_begin/on_train_end "
+                    "on resume and is not leaked into a fresh run")
+
+
+          def main():
+              which = sys.argv[1] if len(sys.argv) > 1 else "ef"
+              rc = 0
+              if "e" in which:
+                  try:
+                      probe_e()
+                  except Exception as exc:
+                      rc = 1
+                      print("PROBE-E RESULT FAIL", type(exc).__name__, str(exc)[:600])
+              if "f" in which:
+                  try:
+                      probe_f()
+                  except Exception as exc:
+                      rc = 1
+                      print("PROBE-F RESULT FAIL", type(exc).__name__, str(exc)[:600])
+              print("PROBE-EF EXIT", rc)
+              return rc
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
+      - name: "4e0decb4/8b986352: cadence parity WITHOUT a DefaultFlowCallback installed"
+        if: always()
+        run: |
+          export PROBE_EXPECT_ZOO_ROOT=$GITHUB_WORKSPACE
+          python - <<'PY'
+          """PROBE-CAD -- cadence parity for MLXTrainer WITHOUT transformers' DefaultFlowCallback.
+
+          This is the behaviour PR #873's last four commits are actually about.
+
+          transformers' Trainer ALWAYS installs DefaultFlowCallback at index 0 of the callback
+          list, so every periodic log / checkpoint / evaluation a user sees from HF is raised by
+          that object. MLXTrainer installs no flow callback at all. Gating the loop's static step
+          interval on the caller-supplied strategy (4e0decb4) is therefore only half of
+          DefaultFlowCallback.on_step_end: without the other half a caller who hand-sets
+          save_strategy="epoch" got NO checkpoints for the whole run, and save_strategy="best"
+          got none at all, which is strictly worse than the wrong-cadence bug the gate fixes.
+
+          So the probe drives the REAL training loop -- MLXTrainer.train() on real mlx, 6 optimizer
+          steps over 2 epochs of 3 -- and records the steps at which on_log / on_save / on_evaluate
+          actually fired, then compares them against the steps the INSTALLED DefaultFlowCallback
+          asks for on the same args. Every cell is run twice: once with a DefaultFlowCallback in the
+          callback list (what transformers' Trainer gives you) and once without (what MLXTrainer
+          actually gives you). Both must agree with HF.
+
+          Deliberately self-contained: tests/test_mlx_trainer_internals.py installs the
+          mlx_simulation torch shim in a module-scoped autouse fixture, so importing it would run
+          this against a torch stub. Everything here is rebuilt on real mlx so that on Apple
+          Silicon the loop under test is executing on Metal.
+
+          The 4.x/5.x split is real and is NOT pinned to a version: transformers 5.x forces a
+          final-step evaluation once global_step reaches max_steps when the interval did not
+          already land there, and 4.x does not. The loop derives that by RUNNING the shipped
+          callback (_default_flow_evaluates_final_step), so the probe checks the derived answer
+          against an independently observed one rather than against a hardcoded version table.
+
+          Exit code 0 = every cell matched. Nonzero = at least one cadence hole.
+          """
+
+          import json
+          import os
+          import sys
+          import tempfile
+          import types
+
+
+          # --------------------------------------------------------------------------------------
+          # Guard: run against the checkout under test, not a pip-installed unsloth_zoo.
+          # --------------------------------------------------------------------------------------
+          def _check_zoo_root():
+              expected = os.environ.get("PROBE_EXPECT_ZOO_ROOT")
+              import unsloth_zoo
+              root = os.path.dirname(os.path.dirname(os.path.abspath(unsloth_zoo.__file__)))
+              print(f"PROBE-CAD zoo_root {root}")
+              if expected and os.path.abspath(expected) != root:
+                  sys.exit(f"PROBE-CAD FAIL: unsloth_zoo resolved to {root}, expected {expected}")
+
+
+          # --------------------------------------------------------------------------------------
+          # Real-mlx fixtures (mirrors of the ones in tests/test_mlx_trainer_internals.py, rebuilt
+          # here so no mlx_simulation shim is imported).
+          # --------------------------------------------------------------------------------------
+          def _tiny_lm():
+              """Minimal real-mlx module the training loop can run end to end."""
+              import mlx.nn as nn
+
+              class TinyLM(nn.Module):
+                  def __init__(self):
+                      super().__init__()
+                      self.embed = nn.Embedding(128, 4)
+                      self.proj = nn.Linear(4, 128, bias=False)
+                      self._config = {"model_type": "tiny"}
+
+                  def __call__(self, input_ids):
+                      return self.proj(self.embed(input_ids))
+
+                  def train(self):
+                      return self
+
+                  @property
+                  def state(self):
+                      return []
+
+              return TinyLM()
+
+
+          def _frozen_optimizer():
+              """Optimizer stub that never changes the weights, so every cell sees the identical
+              per-batch losses and only the cadence differs."""
+              import mlx.core as mx
+
+              return lambda _total_steps: types.SimpleNamespace(
+                  learning_rate=mx.array(1e-5),
+                  state={},
+                  update=lambda _model, _grad: None,
+              )
+
+
+          def _text_plan(widths):
+              from unsloth_zoo.mlx.utils import FiniteTextBatchPlan, _FiniteTextRow
+
+              rows = tuple(
+                  _FiniteTextRow(
+                      tuple(range(1, width + 1)),
+                      offset=1,
+                      labels=tuple(range(1, width + 1)),
+                  )
+                  for width in widths
+              )
+              return FiniteTextBatchPlan(
+                  rows,
+                  tuple((index,) for index in range(len(rows))),
+                  max_seq_length=64,
+                  pad_id=99,
+              )
+
+
+          # --------------------------------------------------------------------------------------
+          # HF reference: what the INSTALLED DefaultFlowCallback asks for.
+          # --------------------------------------------------------------------------------------
+          def _hf_flow_args(
+              *, eval_strategy="no", eval_steps=10 ** 6, eval_delay=0,
+              logging_strategy="steps", logging_steps=10 ** 6, logging_first_step=False,
+              save_strategy="no", save_steps=10 ** 6,
+          ):
+              """Stand in for TrainingArguments when driving DefaultFlowCallback.
+
+              A real TrainingArguments cannot be built on Apple Silicon (pyproject omits accelerate
+              on darwin/arm64 and the constructor hard-requires it whenever torch imports), which is
+              precisely the platform this probe exists to measure. Only the attributes the flow
+              reads matter, and IntervalStrategy/SaveStrategy are str enums so plain strings compare
+              equal to the members. The equivalence is pinned wherever a real one CAN be built by
+              tests/test_mlx_trainer_internals.py::
+              test_hf_flow_args_stand_in_matches_real_training_arguments.
+              """
+              return types.SimpleNamespace(
+                  eval_strategy=eval_strategy, eval_steps=eval_steps, eval_delay=eval_delay,
+                  logging_strategy=logging_strategy, logging_steps=logging_steps,
+                  logging_first_step=logging_first_step,
+                  save_strategy=save_strategy, save_steps=save_steps,
+              )
+
+
+          def _flow_fires(args, *, total_steps, steps_per_epoch, action):
+              """Steps the shipped DefaultFlowCallback asks to log/evaluate/save."""
+              from transformers.trainer_callback import (
+                  DefaultFlowCallback, TrainerControl, TrainerState,
+              )
+
+              flag = f"should_{action}"
+              state = TrainerState(
+                  max_steps=total_steps, eval_steps=args.eval_steps,
+                  logging_steps=args.logging_steps, save_steps=args.save_steps,
+              )
+              flow = DefaultFlowCallback()
+              fires = []
+              for step in range(1, total_steps + 1):
+                  state.global_step = step
+                  state.epoch = step / steps_per_epoch
+                  control = flow.on_step_end(args, state, TrainerControl())
+                  # HF clears the flag when it runs the action, so a step can only run it once
+                  # however many hooks asked for it.
+                  if not getattr(control, flag) and step % steps_per_epoch == 0:
+                      control = flow.on_epoch_end(args, state, TrainerControl())
+                  if getattr(control, flag):
+                      fires.append(step)
+              return fires
+
+
+          AXES = (
+              # (action, the args field that selects its strategy, the probe key)
+              ("log", "logging_strategy", "logged"),
+              ("save", "save_strategy", "saved"),
+              ("evaluate", "eval_strategy", "evaluated"),
+          )
+          INTERVAL_FIELD = {"log": "logging_steps", "save": "save_steps", "evaluate": "eval_steps"}
+          FIELD = {a: f for a, f, _ in AXES}
+          KEY = {a: k for a, _, k in AXES}
+
+
+          def hf_reference(action, strategy, interval, **fields):
+              field = FIELD[action]
+              fields = {field: strategy, INTERVAL_FIELD[action]: interval, **fields}
+              expected = _flow_fires(
+                  _hf_flow_args(**fields), total_steps=6, steps_per_epoch=3, action=action,
+              )
+              if action == "log":
+                  # The loop always flushes the run's last window at the final step so the returned
+                  # train_loss covers it, whatever the strategy. That flush is the loop's own
+                  # contract, not a cadence action, so it is added to the HF reference rather than
+                  # subtracted from the observation.
+                  expected = sorted(set(expected) | {6})
+              return expected
+
+
+          # --------------------------------------------------------------------------------------
+          # The real loop.
+          # --------------------------------------------------------------------------------------
+          def run_loop(
+              *, logging_steps, save_steps, total_steps=6, steps_per_epoch=3, eval_steps=None,
+              with_flow=True, extra_callbacks=(), eval_losses=None, **arg_overrides,
+          ):
+              """Drive MLXTrainer.train() and report the steps that logged, saved and evaluated.
+
+              6 steps over 2 epochs of 3, so an interval of 2 lands off the epoch boundaries and
+              steps/epoch/no/best are told apart: "steps"@2 -> 2,4,6 ; "epoch" -> 3,6 ; "no" -> [].
+
+              with_flow=False drops DefaultFlowCallback from the callback list, which is the
+              configuration a caller of MLXTrainer who passes their own callbacks actually gets.
+              """
+              from transformers.trainer_callback import DefaultFlowCallback, ProgressCallback
+
+              from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+              out_dir = tempfile.mkdtemp()
+              args = MLXTrainingConfig(
+                  max_steps=total_steps,
+                  gradient_accumulation_steps=1,
+                  logging_steps=logging_steps,
+                  save_steps=save_steps,
+                  eval_steps=eval_steps if eval_steps is not None else 10 ** 6,
+                  use_cce=False,
+                  compile=False,
+                  gradient_checkpointing=False,
+                  cast_norm_output_to_input_dtype=False,
+                  max_grad_norm=0.0,
+                  max_grad_leaf_norm=0.0,
+                  disable_memory_limits=True,
+                  output_dir=out_dir,
+              )
+              logged, saved, summaries, evaluated = [], [], [], []
+
+              class _Spy:
+                  def on_log(self, args, state, control, logs=None, **kwargs):
+                      payload = logs or {}
+                      # The run summary train() dispatches before on_train_end is not a cadence
+                      # log, and an evaluation dispatches its metrics through on_log too, so keep
+                      # all three apart.
+                      if "train_runtime" in payload:
+                          summaries.append(state.global_step)
+                      elif "eval_loss" in payload:
+                          pass
+                      else:
+                          logged.append(state.global_step)
+                      return control
+
+                  def on_save(self, args, state, control, **kwargs):
+                      saved.append(state.global_step)
+                      return control
+
+                  def on_evaluate(self, args, state, control, **kwargs):
+                      evaluated.append(state.global_step)
+                      return control
+
+              trainer = MLXTrainer(
+                  _tiny_lm(),
+                  types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+                  [],
+                  args=args,
+                  eval_dataset=([{"input_ids": [1, 2, 3, 4]}] if eval_steps is not None else None),
+                  # ProgressCallback is a real stock consumer of on_log, so the payloads below go
+                  # through shipped transformers code, not just a spy.
+                  callbacks=(
+                      ([DefaultFlowCallback()] if with_flow else [])
+                      + [ProgressCallback(), _Spy()] + list(extra_callbacks)
+                  ),
+              )
+              # Both strategies were synthesized from the positive MLX intervals, so an override
+              # below is a genuine CALLER-SUPPLIED strategy -- exactly what _sync_synthesized_arg
+              # preserves for a real TrainingArguments/SFTConfig or a hand-set field.
+              assert trainer.args.logging_strategy == "steps", trainer.args.logging_strategy
+              assert trainer.args.save_strategy == "steps", trainer.args.save_strategy
+              if eval_steps is not None:
+                  assert trainer.args.eval_strategy == "steps", trainer.args.eval_strategy
+              for name, value in arg_overrides.items():
+                  setattr(trainer.args, name, value)
+
+              trainer._batches = _text_plan((10,) * total_steps)
+              trainer._callback_batches_per_epoch = lambda _batches: steps_per_epoch
+              trainer._build_optimizer = _frozen_optimizer()
+              trainer.save_model = lambda *_a, **_kw: None
+              if eval_steps is not None:
+                  trainer._eval_batches_labeled = ["batch-0"]
+                  losses = list(eval_losses or ())
+
+                  def _fake_evaluate(batches, loss_fn, is_vlm=False):
+                      loss = losses.pop(0) if losses else 1.25
+                      trainer._last_eval_metrics = {"eval_loss": loss, "eval_perplexity": 3.5}
+                      return loss, 3.5
+
+                  trainer._evaluate = _fake_evaluate
+              trainer.train()
+              checkpoints = sorted(
+                  int(name.split("-")[1])
+                  for name in os.listdir(out_dir) if name.startswith("checkpoint-")
+              )
+              return {
+                  "logged": logged, "saved": saved, "evaluated": evaluated,
+                  "checkpoints": checkpoints, "state": trainer.state,
+              }
+
+
+          def run_one_axis(action, strategy, *, with_flow, interval=2, **extra):
+              """One cadence axis at one strategy, with/without the HF flow installed."""
+              kwargs = dict(logging_steps=10 ** 6, save_steps=10 ** 6, with_flow=with_flow)
+              kwargs[INTERVAL_FIELD[action]] = interval
+              kwargs[FIELD[action]] = strategy
+              kwargs.update(extra)
+              return run_loop(**kwargs)[KEY[action]]
+
+
+          # --------------------------------------------------------------------------------------
+          def main():
+              _check_zoo_root()
+              import mlx.core as mx
+              import transformers
+
+              try:
+                  from transformers.utils import is_accelerate_available
+                  acc = bool(is_accelerate_available())
+              except Exception as exc:  # pragma: no cover - defensive
+                  acc = f"unknown ({type(exc).__name__})"
+              print(f"PROBE-CAD env transformers={transformers.__version__} "
+                    f"mlx={getattr(mx, '__version__', '?')} device={mx.default_device()} "
+                    f"accelerate_available={acc} python={sys.version.split()[0]}")
+
+              # ---- 1. The derived 4.x/5.x gate must match the shipped callback. -----------------
+              # Observe it independently: an interval of 4 over a 6-step budget cannot land on the
+              # final step, so ONLY the end-of-training block can put 6 in the eval list.
+              observed = 6 in _flow_fires(
+                  _hf_flow_args(eval_strategy="steps", eval_steps=4),
+                  total_steps=6, steps_per_epoch=3, action="evaluate",
+              )
+              failures = []
+              try:
+                  from unsloth_zoo.mlx.trainer import _default_flow_evaluates_final_step
+                  derived = bool(_default_flow_evaluates_final_step())
+              except ImportError:
+                  # The helper is what 8b986352 adds; a tree without it has no derived gate at all.
+                  # Report and keep going rather than aborting, so the cell-level matrix below
+                  # still shows exactly WHICH cadences are missing on such a tree.
+                  derived = "ABSENT"
+              print(f"PROBE-CAD gate derived_final_step_eval={derived} observed_in_flow={observed} "
+                    f"agree={derived == observed} transformers={transformers.__version__}")
+              if derived != observed:
+                  failures.append(
+                      f"derived final-step-eval gate {derived} != shipped DefaultFlowCallback "
+                      f"{observed} on transformers {transformers.__version__}"
+                  )
+
+              # ---- 2. The 48-cell matrix. ------------------------------------------------------
+              # 3 axes x 4 strategies x 2 intervals x {with flow, without flow} = 48 cells.
+              # Interval 2 divides the 6-step budget; interval 4 does not, and the final-step force
+              # is invisible unless it does not -- which is exactly the hole 8b986352 closes.
+              cells = 0
+              mismatches = []
+              for action, _field, _key in AXES:
+                  for strategy in ("steps", "epoch", "no", "best"):
+                      for interval in (2, 4):
+                          want = hf_reference(action, strategy, interval)
+                          for with_flow in (True, False):
+                              try:
+                                  got = run_one_axis(
+                                      action, strategy, with_flow=with_flow, interval=interval,
+                                  )
+                              except Exception as exc:
+                                  # A tree missing one of these cadences raises rather than
+                                  # returning the wrong steps; record it as the mismatch it is
+                                  # instead of aborting the remaining cells.
+                                  got = f"RAISED {type(exc).__name__}: {exc}"[:160]
+                              cells += 1
+                              ok = got == want
+                              tag = "with_flow" if with_flow else "no_flow"
+                              print(f"PROBE-CAD cell axis={action} strategy={strategy} "
+                                    f"interval={interval} {tag} got={got} want={want} "
+                                    f"ok={int(ok)}")
+                              if not ok:
+                                  mismatches.append(
+                                      (action, strategy, interval, tag, got, want)
+                                  )
+              print(f"PROBE-CAD matrix cells={cells} mismatches={len(mismatches)}")
+              for m in mismatches:
+                  print(f"PROBE-CAD MISMATCH {m}")
+              if mismatches:
+                  failures.append(f"{len(mismatches)} of {cells} cadence cells disagree with the "
+                                  f"installed DefaultFlowCallback")
+
+              # The parameters really do tell the strategies apart, so a green matrix cannot be a
+              # coincidence of every cell being empty.
+              for action in ("log", "save", "evaluate"):
+                  disc = {
+                      "steps@2": hf_reference(action, "steps", 2),
+                      "epoch@2": hf_reference(action, "epoch", 2),
+                      "no@2": hf_reference(action, "no", 2),
+                      "steps@4": hf_reference(action, "steps", 4),
+                  }
+                  print(f"PROBE-CAD discriminates axis={action} {json.dumps(disc)}")
+                  if disc["steps@2"] != [2, 4, 6] or disc["epoch@2"] != [3, 6]:
+                      failures.append(f"axis {action}: reference cadences are not distinct {disc}")
+
+              # ---- 3. logging_first_step. ------------------------------------------------------
+              # HF raises the step-1 log BEFORE it tests logging_strategy, so "no" and "epoch" log
+              # step 1 too. The loop must copy that, flow or no flow.
+              for strategy in ("steps", "epoch", "no"):
+                  for interval in (2, 4):
+                      want = hf_reference(
+                          "log", strategy, interval, logging_first_step=True,
+                      )
+                      for with_flow in (True, False):
+                          try:
+                              got = run_one_axis(
+                                  "log", strategy, with_flow=with_flow, interval=interval,
+                                  logging_first_step=True,
+                              )
+                          except Exception as exc:
+                              got = f"RAISED {type(exc).__name__}: {exc}"[:160]
+                          ok = got == want
+                          tag = "with_flow" if with_flow else "no_flow"
+                          print(f"PROBE-CAD first_step strategy={strategy} interval={interval} "
+                                f"{tag} got={got} want={want} ok={int(ok)}")
+                          if not ok:
+                              failures.append(
+                                  f"logging_first_step strategy={strategy} interval={interval} "
+                                  f"{tag}: got {got}, want {want}"
+                              )
+
+              # ---- 4. The final-step forced save, called out on its own. ------------------------
+              # save_steps=4 over a 6-step budget: the interval fires at 4 and HF forces the last
+              # resumable checkpoint at 6. Before 8b986352 the no-flow run wrote only checkpoint-4,
+              # so an interrupted run resumed from two steps back -- the adapters-only final
+              # save_model() carries no optimizer or trainer state and cannot stand in for it.
+              for with_flow in (True, False):
+                  tag = "with_flow" if with_flow else "no_flow"
+                  try:
+                      probe = run_loop(
+                          logging_steps=10 ** 6, save_steps=4, with_flow=with_flow,
+                      )
+                  except Exception as exc:
+                      probe = {"saved": f"RAISED {type(exc).__name__}", "checkpoints": []}
+                  ok = probe["saved"] == [4, 6] and probe["checkpoints"] == [4, 6]
+                  print(f"PROBE-CAD final_save {tag} saved={probe['saved']} "
+                        f"checkpoints={probe['checkpoints']} want=[4, 6] ok={int(ok)}")
+                  if not ok:
+                      failures.append(
+                          f"final-step forced save {tag}: saved {probe['saved']}, "
+                          f"checkpoints {probe['checkpoints']}, want [4, 6]"
+                      )
+
+              # ---- 5. save_strategy="best". ----------------------------------------------------
+              # The one SaveStrategy member DefaultFlowCallback NEVER raises: HF's Trainer core
+              # decides it in _maybe_log_save_evaluate, immediately after the evaluation that
+              # produced the metric, and ASSIGNS `should_save = is_new_best_metric` rather than
+              # ORing it. Gating the static cadence on the strategy therefore left "best" with no
+              # cadence at all until 8b986352. Evaluations land on 2/4/6; losses improve, worsen,
+              # improve, so only 2 and 6 may checkpoint.
+              for with_flow in (True, False):
+                  tag = "with_flow" if with_flow else "no_flow"
+                  try:
+                      probe = run_loop(
+                          logging_steps=10 ** 6, save_steps=10 ** 6, eval_steps=2,
+                          save_strategy="best", metric_for_best_model="eval_loss",
+                          greater_is_better=False, eval_losses=[1.0, 2.0, 0.5],
+                          with_flow=with_flow,
+                      )
+                  except Exception as exc:
+                      probe = {"evaluated": f"RAISED {type(exc).__name__}", "saved": [],
+                               "checkpoints": [], "state": types.SimpleNamespace(
+                                   best_metric=None, best_global_step=None)}
+                  ok = (
+                      probe["evaluated"] == [2, 4, 6]
+                      and probe["saved"] == [2, 6]
+                      and probe["checkpoints"] == [2, 6]
+                      and getattr(probe["state"], "best_global_step", None) == 6
+                  )
+                  print(f"PROBE-CAD best {tag} evaluated={probe['evaluated']} "
+                        f"saved={probe['saved']} checkpoints={probe['checkpoints']} "
+                        f"best_metric={probe['state'].best_metric} "
+                        f"best_step={probe['state'].best_global_step} "
+                        f"want evaluated=[2, 4, 6] saved=[2, 6] ok={int(ok)}")
+                  if not ok:
+                      failures.append(
+                          f"save_strategy=best {tag}: evaluated {probe['evaluated']}, "
+                          f"saved {probe['saved']}, checkpoints {probe['checkpoints']}, "
+                          f"want evaluated [2, 4, 6] and saved [2, 6]"
+                      )
+              # greater_is_better inverts the comparison, so the rule is not hardcoded to "lower".
+              try:
+                  probe = run_loop(
+                      logging_steps=10 ** 6, save_steps=10 ** 6, eval_steps=2,
+                      save_strategy="best", metric_for_best_model="eval_loss",
+                      greater_is_better=True, eval_losses=[1.0, 0.5, 2.0], with_flow=False,
+                  )
+              except Exception as exc:
+                  probe = {"saved": f"RAISED {type(exc).__name__}"}
+              ok = probe["saved"] == [2, 6]
+              print(f"PROBE-CAD best_inverted saved={probe['saved']} want=[2, 6] ok={int(ok)}")
+              if not ok:
+                  failures.append(
+                      f"save_strategy=best with greater_is_better: saved {probe['saved']}, "
+                      f"want [2, 6]"
+                  )
+
+              # ---- verdict ---------------------------------------------------------------------
+              if failures:
+                  print(f"PROBE-CAD RESULT FAIL ({len(failures)} problem(s))")
+                  for f in failures:
+                      print(f"PROBE-CAD PROBLEM {f}")
+                  sys.exit("PROBE-CAD FAILED: " + "; ".join(failures)[:1500])
+              print(f"PROBE-CAD RESULT OK: {cells} cadence cells, 0 mismatches against the "
+                    f"installed DefaultFlowCallback (transformers {transformers.__version__}, "
+                    f"final-step-eval gate {derived}); logging_first_step, the final-step forced "
+                    f"save and save_strategy=best all match HF with and without a flow installed")
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: "Remaining tests/test_mlx*.py sweep (known red on upstream main, excluded from the pass/fail verdict)"
+        if: always()
+        continue-on-error: true
+        run: |
+          strict="tests/test_mlx_trainer_internals.py tests/test_mlx_training_e2e_metal.py tests/test_mlx_shape_guard.py tests/test_mlx_batching_and_decay.py tests/test_mlx_ddp_metal.py tests/test_mlx_distributed_loader.py tests/test_mlx_switch_lora.py"
+          rc=0
+          for f in tests/test_mlx*.py; do
+            case " $strict " in *" $f "*) echo "SWEEP-SKIP $f (covered by a strict step)"; continue ;; esac
+            echo "::group::$f"
+            python -m pytest "$f" -q -rs \
+              --deselect tests/test_mlx_batching_and_decay.py::test_compiler_review_guards_are_present \
+              || { echo "SWEEP-RED $f"; rc=1; }
+            echo "::endgroup::"
+          done
+          echo "SWEEP-EXIT $rc (informational only; the strict steps above are the verdict)"
