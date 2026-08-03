@@ -1,33 +1,64 @@
-name: "staging-960 ubuntu-latest"
+# Staging-only workflow for unsloth-zoo PR #960 review.
+#
+# Runs the response-masking tests that consolidated-tests-ci.yml only collects,
+# on Linux, so the PR's no-match change is exercised per platform.
+
+name: "staging-960 ubuntu-latest (masking)"
+
 on:
   push:
     branches: ["pr-960-xplat-ci"]
-    paths:
-      - 'studio/**'
-      - '.github/workflows/staging-960-ubuntu-latest.yml'
   workflow_dispatch:
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
 permissions:
   contents: read
+
 defaults:
   run:
     shell: bash
+
 jobs:
-  test:
+  masking:
+    name: response-masking tests (Linux)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       UNSLOTH_COMPILE_DISABLE: '1'
       UNSLOTH_IS_PRESENT: '1'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: '3.12'
-      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
-      - run: python -m pip install 'torch>=2.4,<2.13' datasets transformers
-      - run: rc=0; PYTHONPATH=studio/backend python -m pytest tests/test_find_common_token_ids_no_match.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' || rc=$?; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; exit "$rc"
+          cache: 'pip'
+
+      - name: Install zoo + torch
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.4.0,<2.11.0"
+          pip install -e .[core]
+          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
+          pip install pytest==9.0.3
+
+      - name: PR regression suite (HARD GATE)
+        run: python -m pytest tests/test_find_common_token_ids_no_match.py -v
+
+      - name: Response-masking tests upstream CI only collects
+        run: |
+          python -m pytest \
+            tests/test_train_on_responses_list_labels.py \
+            tests/test_zephyr_marker_context.py \
+            tests/test_reasoning_marker_strip.py \
+            tests/test_mlx_autodetect_template_source.py \
+            tests/test_mlx_trainer_internals.py \
+            tests/test_mlx_module_exports.py \
+            tests/test_mlx_vlm_label_masks.py \
+            tests/test_pr684_review_fixes_a.py \
+            -v -rs

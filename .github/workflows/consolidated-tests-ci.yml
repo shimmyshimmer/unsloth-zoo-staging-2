@@ -115,6 +115,13 @@ jobs:
             tests/test_get_transformers_model_type_empty.py \
             tests/test_train_on_responses_list_labels.py \
             tests/test_find_common_token_ids_no_match.py \
+            tests/test_check_hf_model_exists_transport_errors.py \
+            tests/test_hub_transport_errors_single_segment.py \
+            tests/test_quant_status_transport_errors.py \
+            tests/test_local_base_model_resolution_offline.py \
+            tests/test_local_fp8_base_offline_resolution.py \
+            tests/test_local_4bit_merge_offline_resolution.py \
+            tests/test_gated_and_offline_config_classification.py \
             -v
 
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
