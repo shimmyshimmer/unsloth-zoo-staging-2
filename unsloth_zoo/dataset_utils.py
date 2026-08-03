@@ -152,12 +152,27 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
         substring = all_input_ids[0]
     pass
 
-    # Recover optional left/right tokens around the matched core
+    # Recover optional left/right tokens around the matched core. `substring` is the
+    # common core across probe variants that each carry an appended [0] sentinel, so
+    # it is NOT guaranteed to be a sublist of `original` - the core can come back as
+    # the bare sentinel when the variants share nothing else. Track the match index
+    # explicitly: letting the loop fall through left `j` pointing at the last index,
+    # so we sliced as though a match had happened there and returned optional_left /
+    # optional_right tokens that were never matched. A component that tokenizes to
+    # nothing left `j` unbound entirely (UnboundLocalError). On no match, report no
+    # optional context rather than inventing it; callers already handle an empty core
+    # (get_chat_template_parts.validate treats it as "no match" and reports a clear
+    # auto-detection error).
     original = tokenizer(component, add_special_tokens = False).input_ids
+    where = -1
     for j in range(len(original)):
-        if original[j : j + len(substring)] == substring: break
-    optional_left  = original[:j]
-    optional_right = original[j+len(substring):]
+        if original[j : j + len(substring)] == substring:
+            where = j
+            break
+    if where == -1:
+        return substring, [], []
+    optional_left  = original[:where]
+    optional_right = original[where+len(substring):]
     return substring, optional_left, optional_right
 pass
 
@@ -393,6 +408,18 @@ def train_on_responses_only(
     # Get most common tokens since tokenizers can tokenize stuff differently!
     Q_must, Q_left, Q_right = _find_common_token_ids(instruction_part, tokenizer, force_match)
     A_must, A_left, A_right = _find_common_token_ids(response_part,    tokenizer, force_match)
+
+    # An explicitly-passed marker that tokenizes to nothing yields an empty core, so
+    # fail with a named error instead of IndexError on A_must[0] below. The
+    # auto-detect path cannot reach this (get_chat_template_parts rejects empty
+    # markers before returning); only explicit instruction_part / response_part can.
+    if len(Q_must) == 0 or len(A_must) == 0:
+        _empty = "instruction_part" if len(Q_must) == 0 else "response_part"
+        raise ValueError(
+            f"Unsloth: {_empty} tokenizes to no tokens, so it cannot be matched against "
+            "your dataset. Pass a non-empty marker, or pass neither to auto-detect both."
+        )
+    pass
 
     # Store some temporary stuff
     A_first = A_must[0]
