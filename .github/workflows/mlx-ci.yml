@@ -5,15 +5,12 @@
 # resolve. Installs `unsloth_zoo[mlx]`, smoke-imports unsloth_zoo/mlx_*.py modules,
 # runs tests/test_mlx_torch_shim_smoke.py. Opt-in via `mlx` label to save macOS minutes.
 
-name: MLX CI on Mac M1
+name: "staging-960 MLX CI on Mac M1"
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, labeled]
+  push:
+    branches: ["pr-960-xplat-ci"]
   workflow_dispatch:
-  schedule:
-    # Daily @ 04:23 UTC -- off the security-audit cron rush at 04:13.
-    - cron: '23 4 * * *'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -25,11 +22,6 @@ permissions:
 jobs:
   mlx-smoke:
     name: MLX install + import smoke (Apple Silicon)
-    # Opt-in: schedule / workflow_dispatch always run; PR runs only with `mlx` label.
-    if: >-
-      github.event_name == 'schedule' ||
-      github.event_name == 'workflow_dispatch' ||
-      contains(github.event.pull_request.labels.*.name, 'mlx')
     runs-on: macos-14   # Apple Silicon (M1) hosted runner
     timeout-minutes: 30
     steps:
