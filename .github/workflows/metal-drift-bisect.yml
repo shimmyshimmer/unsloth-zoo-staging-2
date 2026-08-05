@@ -71,3 +71,14 @@ jobs:
         run: |
           python tests/mlx_layerwise_drift.py \
             --model mlx-community/gemma-3n-E2B-it-4bit --rounds 3
+
+      - name: Which op is not reproducible?
+        # The bisect put the first difference at decoder layer 0, upstream of
+        # every KV-shared layer and far too large to be float
+        # non-associativity. This walks from the layer down to the op, ending
+        # at bare mx.quantized_matmul against an unquantized control, so the
+        # finding can be filed with neither mlx-vlm nor unsloth in it.
+        if: always()
+        run: |
+          python tests/mlx_op_drift.py \
+            --model mlx-community/gemma-4-e2b-it-4bit --rounds 4

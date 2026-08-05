@@ -59,9 +59,10 @@ def capture(model, ids, n_layers):
     out = model.language_model(ids, capture_layer_ids=list(range(n_layers)))
     hidden = out.hidden_states
     if not hidden:
-        raise SystemExit(
-            "this model's language_model did not fill hidden_sink, so it does "
-            "not support capture_layer_ids; nothing to bisect")
+        # Not a failure: only some families thread capture_layer_ids through.
+        # Saying so and standing down is the honest result, and it keeps a red
+        # job meaning "the drift moved" rather than "the control is unsupported".
+        return None, None
     mx.eval(*hidden, out.logits)
     to_np = lambda a: __import__("numpy").asarray(a.astype(mx.float32))
     return [to_np(h) for h in hidden], to_np(out.logits)
@@ -95,6 +96,10 @@ def main():
     runs = []
     for r in range(args.rounds):
         hidden, logits = capture(model, ids, n_layers)
+        if hidden is None:
+            print("this model does not thread capture_layer_ids into a "
+                  "hidden_sink, so there is nothing to bisect here", flush=True)
+            return 0
         runs.append(hidden)
         total = float(logits.sum())
         print(f"  round {r}: logit sum={total} finite={np.isfinite(logits).all()}",
