@@ -713,6 +713,95 @@ def train_on_responses_only(
         return hasattr(collator, "image_processor")
     pass
 
+    # What a processor emits beside `input_ids`. A row carrying any of these
+    # still needs the collator that knows how to batch it.
+    _MULTIMODAL_COLUMNS = frozenset((
+        "pixel_values", "pixel_values_videos", "pixel_attention_mask",
+        "image_grid_thw", "video_grid_thw", "image_sizes", "image_sizes_videos",
+        "images", "image", "videos", "video", "audio", "audios",
+        "token_type_ids_images", "input_features", "input_features_mask",
+        "audio_values", "audio_attention_mask", "input_audio_embeds",
+        "aspect_ratio_ids", "aspect_ratio_mask", "cross_attention_mask",
+        # Processor-specific spellings: phi4_multimodal, then pix2struct and
+        # kosmos-2.5, which emit flattened_patches with nothing else alongside.
+        "image_pixel_values", "audio_input_features", "audio_embed_sizes",
+        "high_res_pixel_values", "flattened_patches",
+    ))
+
+    def _dataset_is_pretokenized(dataset):
+        """True when rows carry `input_ids` and nothing else to collate.
+
+        Separates "the collator rebuilds labels from a processor at collate time"
+        from "text was tokenized up front and the collator only pads", where
+        dataset-level masking is correct. Anything unreadable returns False, so
+        the caller keeps the old strict behaviour.
+
+        Rows that also carry image/video/audio columns are NOT that case: the
+        text path below swaps the collator for a text one, which would throw
+        away the user's image handling, so those keep the old refusal.
+        """
+        if dataset is None:
+            return False
+
+        def _text_only(names):
+            names = set(names)
+            return "input_ids" in names and names.isdisjoint(_MULTIMODAL_COLUMNS)
+
+        try:
+            names = getattr(dataset, "column_names", None)
+            if isinstance(names, dict):  # DatasetDict
+                names = [c for v in names.values() for c in (v or [])]
+            if names:
+                return _text_only(names)
+            # IterableDataset and friends expose no column_names; peek one row.
+            for row in dataset:
+                return isinstance(row, dict) and _text_only(row.keys())
+        except Exception:
+            return False
+        return False
+    pass
+
+    def _eval_split_is_raw_text_only(dataset):
+        """True when an eval split carries no `input_ids` but a text column.
+
+        Only ever asked about eval splits. The TRAIN split is the evidence that
+        the run is text-only at all, so it still has to be pretokenized; once it
+        is, the collator is already going to be replaced by a text one, and
+        `_maybe_tokenize_dataset` below tokenizes a raw eval split with the same
+        unwrapped text tokenizer, after which the dataset-level masking lands on
+        it exactly as it does on a pretokenized one. Refusing it would only force
+        users to pretokenize eval by hand to be able to evaluate at all.
+
+        Deliberately narrow: a split carrying neither `input_ids` nor a text
+        column stays refused, because there would be nothing for the text path to
+        tokenize. That is what keeps a conversational multimodal split (columns
+        like `messages` alone, images inline in the turns) on the old refusal
+        instead of being silently emptied.
+        """
+        if dataset is None:
+            return False
+        text_field = getattr(getattr(trainer, "args", None), "dataset_text_field", None) or "text"
+
+        def _raw_text(names):
+            names = set(names)
+            if "input_ids" in names: return False
+            if not names.isdisjoint(_MULTIMODAL_COLUMNS): return False
+            return text_field in names or "text" in names
+
+        try:
+            names = getattr(dataset, "column_names", None)
+            if isinstance(names, dict):  # DatasetDict
+                names = [c for v in names.values() for c in (v or [])]
+            if names:
+                return _raw_text(names)
+            # IterableDataset and friends expose no column_names; peek one row.
+            for row in dataset:
+                return isinstance(row, dict) and _raw_text(row.keys())
+        except Exception:
+            return False
+        return False
+    pass
+
     data_collator = getattr(trainer, "data_collator", None)
     if _is_vision_collator(data_collator):
         masking = getattr(data_collator, "train_on_responses_only", None)
@@ -720,29 +809,56 @@ def train_on_responses_only(
             return trainer  # collator already masks responses; nothing to do
         is_unsloth = any(b.__name__ == "UnslothVisionDataCollator" for b in type(data_collator).__mro__)
         if not is_unsloth:
-            # A processor-style collator we cannot reliably configure: do not return as
-            # if masking were applied (it would leave responses unmasked silently).
-            raise ValueError(
-                "Unsloth: Detected a vision data collator that does not support response-only "
-                "masking. Build UnslothVisionDataCollator(..., train_on_responses_only = True, "
-                "instruction_part = ..., response_part = ...) so masking runs at collate time."
+            # A multimodal model fine-tuned on text only still carries a processor
+            # as its `tokenizer`, so a plain text collator (e.g.
+            # DataCollatorForSeq2Seq) trips `_is_vision_collator` even though it
+            # never rebuilds labels from images. Discriminate on the data: rows
+            # that already hold `input_ids` were tokenized up front, so the text
+            # path below is correct.
+            # Every split that will be collated, not just train: the collator is
+            # swapped for the whole trainer below, so a multimodal eval set would
+            # lose its image handling on a train-only check. Eval splits may also
+            # be raw text, which the text path tokenizes itself; train may not,
+            # since it is what tells us the run is text-only in the first place.
+            _eval = getattr(trainer, "eval_dataset", None)
+            _eval_splits = list(_eval.values()) if isinstance(_eval, dict) else [_eval]
+            _train = getattr(trainer, "train_dataset", None)
+            if not (
+                (_train is None or _dataset_is_pretokenized(_train))
+                and all(_dataset_is_pretokenized(d) or _eval_split_is_raw_text_only(d)
+                        for d in _eval_splits if d is not None)
+            ):
+                # A processor-style collator we cannot reliably configure: do not return as
+                # if masking were applied (it would leave responses unmasked silently).
+                raise ValueError(
+                    "Unsloth: Detected a vision data collator that does not support response-only "
+                    "masking. Build UnslothVisionDataCollator(..., train_on_responses_only = True, "
+                    "instruction_part = ..., response_part = ...) so masking runs at collate time."
+                )
+            # Fall through to the dataset-level text path below; configuring a
+            # collator we do not own would silently do nothing.
+            print(
+                f"Unsloth: `{type(data_collator).__name__}` holds a processor but the "
+                "dataset is already tokenized, so response-only masking is applied at "
+                "the dataset level (image handling is untouched)."
             )
-        # If the collator's tokenizer already carries the parts, let the nested call
-        # read them; passing them explicitly would hit the "already set" guard.
-        coll_proc = getattr(data_collator, "processor", tokenizer)
-        coll_tok = coll_proc.tokenizer if hasattr(coll_proc, "tokenizer") else coll_proc
-        parts = {} if hasattr(coll_tok, "_unsloth_input_part") else \
-            dict(instruction_part = instruction_part, response_part = response_part)
-        data_collator.train_on_responses_only = train_on_responses_only(
-            None,
-            force_match        = force_match,
-            tokenizer          = coll_proc,
-            return_function    = True,
-            last_response_only = last_response_only,
-            **parts,
-        )
-        print(f"Unsloth: Enabled response-only masking on your {type(data_collator).__name__} (image handling kept intact).")
-        return trainer
+        else:
+            # If the collator's tokenizer already carries the parts, let the nested call
+            # read them; passing them explicitly would hit the "already set" guard.
+            coll_proc = getattr(data_collator, "processor", tokenizer)
+            coll_tok = coll_proc.tokenizer if hasattr(coll_proc, "tokenizer") else coll_proc
+            parts = {} if hasattr(coll_tok, "_unsloth_input_part") else \
+                dict(instruction_part = instruction_part, response_part = response_part)
+            data_collator.train_on_responses_only = train_on_responses_only(
+                None,
+                force_match        = force_match,
+                tokenizer          = coll_proc,
+                return_function    = True,
+                last_response_only = last_response_only,
+                **parts,
+            )
+            print(f"Unsloth: Enabled response-only masking on your {type(data_collator).__name__} (image handling kept intact).")
+            return trainer
     pass
 
     if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
@@ -780,16 +896,45 @@ def train_on_responses_only(
         pass
     pass
 
-    # Edit data collator to DataCollatorForSeq2Seq (vision collators were handled
-    # earlier and returned, so trainer.data_collator here is a text collator).
+    # Edit data collator to DataCollatorForSeq2Seq. Collators that rebuild labels
+    # from a processor were handled earlier and returned, so what is left here
+    # only pads already-tokenized text.
     from transformers import DataCollatorForSeq2Seq
     packing_enabled = getattr(trainer.args, "packing", False)
-    if (
-        hasattr(trainer, "data_collator")
-        and not isinstance(trainer.data_collator, DataCollatorForSeq2Seq)
-        and not packing_enabled
+    _collator = getattr(trainer, "data_collator", None)
+    # DataCollatorForSeq2Seq(tokenizer = <VLM processor>) pads through
+    # self.tokenizer.pad / .padding_side, which processors do not have, so it
+    # dies on the first batch. Rebuild that one around the unwrapped text
+    # tokenizer too; gate on the capability rather than the processor type, so
+    # this stays right if transformers ever gives ProcessorMixin a .pad.
+    # Not only the seq2seq one: DataCollatorWithPadding(tokenizer = processor)
+    # and TRL's DataCollatorForVisionLanguageModeling(processor) pad through the
+    # same missing `.pad` and die the same way. Key on a HELD padding object that
+    # cannot pad, so a collator that holds none at all is untouched - that is what
+    # keeps TRL's packing `DataCollatorForLanguageModeling`, which takes a bare
+    # `pad_token_id` and builds the packed position_ids itself, off this path.
+    _pad_source = getattr(_collator, "tokenizer", None)
+    if _pad_source is None:
+        _pad_source = getattr(_collator, "processor", None)
+    _processor_backed = _pad_source is not None and not hasattr(_pad_source, "pad")
+    # A processor-backed collator raises on its first batch whatever packing
+    # says, so that repair is not gated on packing the way the swap is.
+    if hasattr(trainer, "data_collator") and (
+        _processor_backed or (not isinstance(_collator, DataCollatorForSeq2Seq)
+                              and not packing_enabled)
     ):
-        trainer.data_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer)
+        # Carry the settings across when we are only swapping the tokenizer,
+        # so a caller's pad_to_multiple_of or label_pad_token_id survives. Only
+        # for a seq2seq collator: for any other class this is a replacement, not
+        # a tokenizer swap, and its same-named attributes need not mean the same.
+        _same_class = _processor_backed and isinstance(_collator, DataCollatorForSeq2Seq)
+        _kept = {
+            name: getattr(_collator, name)
+            for name in ("model", "padding", "max_length", "pad_to_multiple_of",
+                         "label_pad_token_id", "return_tensors")
+            if _same_class and hasattr(_collator, name)
+        }
+        trainer.data_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer, **_kept)
 
     # Check if all labels randomnly got masked to nothing - maybe wrong chat template?
     from .training_utils import fix_zero_training_loss
