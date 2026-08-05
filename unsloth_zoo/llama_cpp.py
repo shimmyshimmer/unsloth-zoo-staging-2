@@ -2318,6 +2318,111 @@ def _has_mtp_weight_tensors(input_folder, num_layers):
     return False
 
 
+def _find_bitsandbytes_quantization(config, _path = "config.json"):
+    """Where a bitsandbytes `quantization_config` sits, or None.
+
+    Searched recursively because VLMs keep theirs under a sub-config
+    (`text_config`, `vision_config`), which is the same reason
+    `_remove_quantization_config` in saving_utils walks nested dicts rather
+    than only the top level.
+    """
+    if not isinstance(config, dict):
+        return None
+    quant = config.get("quantization_config")
+    if isinstance(quant, dict):
+        method = quant.get("quant_method")
+        # Older checkpoints omit quant_method and only carry the bnb flags.
+        if method == "bitsandbytes" or (
+            method is None
+            and ("load_in_4bit" in quant or "load_in_8bit" in quant)
+        ):
+            return _path
+    for key, value in config.items():
+        if key == "quantization_config" or not isinstance(value, dict):
+            continue
+        found = _find_bitsandbytes_quantization(value, f"{_path}[{key!r}]")
+        if found is not None:
+            return found
+    return None
+
+
+def _converter_was_oom_killed(exc):
+    """Did the kernel kill the converter, rather than it failing on its own?
+
+    The converter holds tensors in host RAM, so a large model on a small VM is
+    OOM-killed and subprocess reports only SIGKILL, naming no resource.
+    """
+    if getattr(exc, "returncode", None) in (-9, 137):
+        return True
+    return "sigkill" in f"{exc}".lower()
+
+
+def _retry_with_temp_file(command):
+    """The same command spooling tensors to disk instead of holding them in RAM.
+
+    `--use-temp-file` is llama.cpp's own answer to this ("helpful when running
+    out of memory, process killed"), but it refuses to run alongside splitting:
+
+        Error: Cannot use temp file when splitting
+
+    and `--split-max-size` is always passed, so the flag has to arrive with
+    splitting disabled. Returns None when the command already has it, so the
+    retry cannot loop.
+    """
+    if "--use-temp-file" in command:
+        return None
+    out = []
+    drop_value = False
+    for token in command:
+        if drop_value:
+            drop_value = False
+            # Only its value. A flag here means the previous one had none, and
+            # eating it would silently drop an unrelated option.
+            if not str(token).startswith("--"):
+                continue
+        if token in ("--split-max-size", "--split-max-tensors"):
+            drop_value = True
+            continue
+        out.append(token)
+    # The trailing model path must stay last.
+    return out[:-1] + ["--use-temp-file"] + out[-1:]
+
+
+def _gguf_output_paths(output_file):
+    """`output_file` plus any shards llama.cpp names after it."""
+    basename_without_gguf = os.path.splitext(output_file)[0]
+    shard_pattern = re.compile(
+        re.escape(os.path.basename(basename_without_gguf)) + r'-(\d{5})-of-(\d{5})\.gguf'
+    )
+    parent_dir = os.path.dirname(output_file) or '.'
+    paths = [output_file]
+    try:
+        # fullmatch, not search: these paths get os.remove'd, and an unanchored
+        # match would delete a neighbour whose name merely ends with ours
+        # (cleaning "model.BF16" would take "old-model.BF16-00001-of-00002").
+        paths += sorted(os.path.join(parent_dir, f) for f in os.listdir(parent_dir)
+                        if shard_pattern.fullmatch(f))
+    except OSError:
+        pass
+    return paths
+
+
+def _remove_gguf_outputs(output_file):
+    """Delete what a failed or abandoned conversion left at `output_file`.
+
+    GGUFWriter.open_output_file opens every shard with "wb" before a single
+    tensor byte is written, and neither the converter nor the writer cleans up
+    on failure, so a nonzero exit or a SIGKILL always leaves truncated files
+    behind. Callers enumerate save_directory.glob("*.gguf") and upload every
+    match, so a leftover is reported and published as a valid artifact.
+    """
+    for path in _gguf_output_paths(output_file):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def convert_to_gguf(
     model_name,
     input_folder,
@@ -2349,6 +2454,27 @@ def convert_to_gguf(
     # Load config.json
     with open(config_path, "r", encoding = "utf-8") as f:
         config_file = json.load(f)
+
+    _bnb_where = _find_bitsandbytes_quantization(config_file)
+    if _bnb_where is not None:
+        # llama.cpp has no bitsandbytes dequantizer, and its converter only
+        # raises `NotImplementedError: Quant method is not yet supported:
+        # 'bitsandbytes'` after reading the whole model, so fail here instead
+        # of after a multi-GB download and a long conversion.
+        # Names both flags: the guard fires on 8bit checkpoints too (they carry
+        # the same quant_method), and naming only the 4bit one would send an
+        # 8bit user back to an identical failure.
+        raise RuntimeError(
+            f"Unsloth: `{input_folder}` still holds bitsandbytes quantized "
+            f"weights (`quantization_config` at {_bnb_where}), and llama.cpp "
+            f"cannot convert those to GGUF.\n"
+            f"GGUF export needs dequantized 16bit weights. Either load the "
+            f"model with `load_in_4bit = False` and `load_in_8bit = False` "
+            f"before saving, or merge a LoRA adapter with "
+            f"`save_method = \"merged_16bit\"`, which downloads the original "
+            f"16bit weights. Saving a quantized model that has no adapter does "
+            f"not dequantize it."
+        )
 
     # The converter sizes block_count from the config, so keep `mtp_num_hidden_layers`
     # only when the weights still carry the MTP layer (else it crashes on the extra
@@ -2440,7 +2566,7 @@ def convert_to_gguf(
                 "--outtype"        : quantization_type,
                 "--split-max-size" : max_shard_size,
             }
-        runs_to_do.append((text_args, text_output, "text model"))
+        runs_to_do.append((text_args, text_output, "text model", True))
 
         # Vision projector conversion
         mmproj_args = {
@@ -2449,7 +2575,9 @@ def convert_to_gguf(
             "--mmproj"         : "",
             "--split-max-size" : max_shard_size,
         }
-        runs_to_do.append((mmproj_args, mmproj_output, "vision projector"))
+        # Optional: the text GGUF above is already written, so a projector
+        # failure must not discard it (see the run loop's non-fatal handler).
+        runs_to_do.append((mmproj_args, mmproj_output, "vision projector", False))
 
     else:
         if is_gpt_oss:
@@ -2475,7 +2603,7 @@ def convert_to_gguf(
                 "--outtype"        : quantization_type,
                 "--split-max-size" : max_shard_size,
             }
-        runs_to_do.append((args, final_output, "model"))
+        runs_to_do.append((args, final_output, "model", True))
 
     # A bare --outfile lands in the process CWD. On Windows that CWD is often not writable
     # (app launched from a protected dir), so the final write failed with PermissionError
@@ -2493,7 +2621,7 @@ def convert_to_gguf(
     _cwd_writable = _dir_is_writable(os.getcwd())
 
     # Execute conversions
-    for args, output_file, description in runs_to_do:
+    for args, output_file, description, required in runs_to_do:
         # Redirect only a bare filename under an unwritable CWD. Absolute paths and
         # relative paths with a directory are the caller's choice; input_folder is probed
         # too since it may be a read-only model source.
@@ -2517,7 +2645,9 @@ def convert_to_gguf(
         # Run the converter; self-heal and retry once if the env (not the model)
         # is broken. No cost on the happy path.
         attempted_repair = False
+        attempted_temp_file = False
         repair_note = ""
+        optional_failed = False
         while True:
             try:
                 # encoding/errors pinned so non-UTF8 output never crashes decoding.
@@ -2550,6 +2680,28 @@ def convert_to_gguf(
                     except Exception as repair_error:
                         repair_note = f"\n--- dependency reinstall failed ---\n{repair_error}"
 
+                # OOM-killed: retry once spooling to disk. Disk is the one
+                # resource these machines have (155GB free on the Colab VM
+                # where Gemma3N_(4B)-Audio dies), and this is what the flag is
+                # for. Only for a kill, so a converter that failed on its own
+                # is not quietly run twice.
+                if not attempted_temp_file and _converter_was_oom_killed(e):
+                    retry = _retry_with_temp_file(command)
+                    if retry is not None:
+                        attempted_temp_file = True
+                        print(
+                            "Unsloth: The GGUF converter ran out of host RAM "
+                            "and was killed. Retrying with --use-temp-file, "
+                            "which spools tensors to disk instead."
+                        )
+                        # The retry drops --split-max-size, so it writes
+                        # model.gguf while the killed split run already created
+                        # every model-00001-of-0000N.gguf. Left in place they
+                        # sit beside the good file and get uploaded with it.
+                        _remove_gguf_outputs(output_file)
+                        command = retry
+                        continue
+
                 if print_output and getattr(e, 'stdout', None):
                     print(e.stdout)
                 cmd = " ".join(str(x) for x in command)
@@ -2562,7 +2714,39 @@ def convert_to_gguf(
                     text = stream if isinstance(stream, str) else stream.decode("utf-8", errors="replace")
                     text = text.strip()
                     if text: details += f"\n--- converter {label} ---\n{text}"
+                if not required:
+                    # Degrade like the existing "Converting as text-only model"
+                    # path, which only covers architectures missing from
+                    # supported_vision_archs. This covers the ones that ARE
+                    # listed but whose projector conversion still fails.
+                    reason = ""
+                    for line in reversed((details or "").splitlines()):
+                        line = line.strip()
+                        if line and ("Error" in line or "Exception" in line):
+                            reason = line
+                            break
+                    # The converter truncates its --outfile at header time,
+                    # before any tensor, so the failed run either left a partial
+                    # projector here or destroyed a good one from an earlier
+                    # export. Callers upload every save_directory/*.gguf, so
+                    # leaving it publishes a broken projector as if it were
+                    # valid, paired with the new text model.
+                    _remove_gguf_outputs(output_file)
+                    is_vlm = False
+                    optional_failed = True
+                    print(
+                        f"Unsloth: Could not convert the {description} to GGUF "
+                        f"({reason or e}). The text model was converted "
+                        f"successfully and is usable; only multimodal "
+                        f"(image/audio) input is unavailable in this GGUF."
+                    )
+                    break
                 raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF with command `{cmd}`: {e}{details}{repair_note}")
+
+        # The failed optional run's partial output was just removed, so
+        # validating it would raise "output file not created" for nothing.
+        if optional_failed:
+            continue
 
         # Simple validation using native Python - check for main file or sharded files
         if os.path.exists(output_file):
