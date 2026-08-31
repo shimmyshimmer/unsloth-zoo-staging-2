@@ -51,13 +51,13 @@ jobs:
           python -m pytest tests/test_hf_xet_fallback.py -q --tb=short > pytest_out.txt 2>&1 || rc=$?
           cat pytest_out.txt
           if [ "$rc" = "5" ]; then echo "no tests ran (deps absent)"; rc=0; fi
-          if [ "$rc" = "2" ] && grep -qE "No module named .(torch|unsloth_zoo|transformers)." pytest_out.txt \
+          if [ "$rc" = "2" ] && grep -qE "No module named .(torch|unsloth_zoo|transformers).|Please install Unsloth" pytest_out.txt \
              && ! grep -qE "^(FAILED|ERROR) " pytest_out.txt; then
             echo "collection needs a dep this runner does not ship"; rc=0
           fi
           if [ "$rc" = "1" ] && ! grep -qE "^ERROR " pytest_out.txt; then
             tot=$(grep -cE "^FAILED " pytest_out.txt || true)
-            dep=$(grep -cE "^FAILED .* No module named .(torch|unsloth_zoo|transformers).$" pytest_out.txt || true)
+            dep=$(grep -cE "^FAILED .* No module named .(torch|unsloth_zoo|transformers).|Please install Unsloth$" pytest_out.txt || true)
             if [ "$tot" -gt 0 ] && [ "$tot" = "$dep" ]; then
               echo "only tests needing an absent dep failed"; rc=0
             fi
