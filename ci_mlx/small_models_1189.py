@@ -28,6 +28,7 @@ equal output with the fusion never entered proves nothing.
 import argparse
 import json
 import sys
+import time
 
 import mlx.core as mx
 from mlx_lm import load
@@ -79,6 +80,28 @@ def main():
     model, tokenizer = load(args.model, **kwargs)
 
     native_text, native_calls = _count_gather_qmm(lambda: _greedy(model, tokenizer))
+
+    # Scope entry repacks gate and up on EVERY entry, and generation_mode opens one
+    # scope per request, so this is added latency on every chat message, not once.
+    entry_ms, copied_mib = [], []
+    for _ in range(3):
+        copied = [0]
+        original_concatenate = mx.concatenate
+
+        def counting(arrays, axis = 0, **kwargs):
+            copied[0] += sum(array.nbytes for array in arrays)
+            return original_concatenate(arrays, axis = axis, **kwargs)
+
+        mx.concatenate = counting
+        start = time.perf_counter()
+        try:
+            with fused_moe_gate_up(model) as scoped:
+                mx.eval(scoped.parameters())
+                entry_ms.append((time.perf_counter() - start) * 1000)
+        finally:
+            mx.concatenate = original_concatenate
+        copied_mib.append(copied[0] / 2 ** 20)
+
     with fused_moe_gate_up(model) as scoped:
         fused_blocks = _fused_module_count(scoped)
         fused_text, fused_calls = _count_gather_qmm(lambda: _greedy(scoped, tokenizer))
@@ -93,6 +116,8 @@ def main():
         "packed_attrs_after_exit": leftover,
         "gather_qmm_native": native_calls,
         "gather_qmm_fused": fused_calls,
+        "scope_entry_ms": [round(value, 1) for value in entry_ms],
+        "scope_entry_copied_mib": [round(value, 1) for value in copied_mib],
         "text_identical": native_text == fused_text,
         "native_text": native_text,
         "fused_text": fused_text,
