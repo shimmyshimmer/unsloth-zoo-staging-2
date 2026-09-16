@@ -659,6 +659,148 @@ def _incomplete_partial_names(
     return names
 
 
+def _blobs_with_a_live_writer() -> Optional[set]:
+    """Basenames of every ``*.incomplete`` blob some LIVE process currently holds open, or ``None``
+    when that cannot be answered on this host.
+
+    ``_child_open_incomplete_blobs`` asks this of one pid. This asks it of every process the current
+    user can see, because the question at the unscoped purge below is not "is this ours" but "is
+    anybody still writing it", and age cannot answer that: a partial can be older than any grace and
+    still belong to a sibling that is paused, blocked on a slow connection or waiting on a retry.
+    Deleting it wastes its transfer and makes its final rename fail.
+
+    ``None`` is the honest answer wherever the question cannot be put -- no psutil, or a platform
+    that refuses the open-file table -- and the caller then declines the unscoped pass rather than
+    guessing. A process the current user may not inspect raises per process and is skipped, so the
+    set is a LOWER bound on live writers; that only matters for another user's download into a cache
+    this user also writes, which is recorded rather than claimed closed.
+
+    Run once, on the Xet to HTTP transition, immediately before the alternative is a repo-wide
+    re-download of every completed shard, so a full process walk is the cheap side of that trade.
+    """
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        return None
+    open_blobs: set = set()
+    try:
+        for proc in psutil.process_iter():
+            try:
+                for handle in proc.open_files():
+                    if handle.path.endswith(INCOMPLETE_SUFFIX):
+                        open_blobs.add(os.path.basename(handle.path))
+            except Exception:
+                # Denied, gone, or a platform that will not list this process's files. One
+                # unreadable process is not a reason to abandon the rest.
+                continue
+    except Exception:
+        return None
+    return open_blobs
+
+
+def _unowned_partials_safe_to_clear(
+    repo_type: str,
+    repo_id: str,
+    cache_dir: Optional[str],
+    active_grace: float,
+    owned_incomplete_blobs: Optional[set],
+) -> Optional[set]:
+    """The partials outside the ownership set that may be removed, or ``None`` for "do not".
+
+    Two conditions, both required. Older than *active_grace*, which is the patient HTTP grace this
+    transition already applies, and not open by any live process, which is the part age cannot
+    establish. When the open-file table cannot be read at all the answer is ``None`` and the caller
+    skips the pass entirely, so a host without psutil never widens the purge beyond the ownership
+    set on age alone.
+    """
+    live_writers = _blobs_with_a_live_writer()
+    if live_writers is None:
+        return None
+    owned = owned_incomplete_blobs or set()
+    now = time.time()
+    clearable: set = set()
+    try:
+        for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
+            blobs_dir = entry / "blobs"
+            if not blobs_dir.is_dir():
+                continue
+            for blob in blobs_dir.iterdir():
+                try:
+                    if not (blob.is_file() and blob.name.endswith(INCOMPLETE_SUFFIX)):
+                        continue
+                    if blob.name in owned or blob.name in live_writers:
+                        continue
+                    if now - blob.stat().st_mtime < active_grace:
+                        continue
+                except OSError:
+                    continue
+                clearable.add(blob.name)
+    except Exception:
+        return None
+    return clearable
+
+
+def _clear_unsafe_partials_for_http(
+    repo_type: str,
+    repo_id: str,
+    *,
+    cache_dir: Optional[str] = None,
+    active_grace: float = DEFAULT_HTTP_STALL_TIMEOUT,
+    owned_incomplete_blobs: Optional[set] = None,
+) -> Optional[set]:
+    """Last, BLOB-SCOPED attempt to clear the partials that block a safe HTTP resume. Returns the
+    partial names that SURVIVED, or ``None`` when the cache could not be read (not the same answer as
+    "none of them", and never proof that anything was cleared).
+
+    The alternative at this point is ``force_download`` on the params handed to the retry, and that
+    flag is REPO-WIDE: huggingface_hub hands back an already-resolvable pointer only under ``not
+    force_download``, so a snapshot re-fetches every ALREADY VERIFIED shard as well. That is issue
+    #9094 -- a cached multi-shard model re-downloading from zero, and failing 14 minutes later,
+    because one partial survived the purge. Removing the blob instead leaves exactly the affected
+    file missing, which is then the only file hub fetches.
+
+    This is NOT a judgement that a surviving partial is a safe prefix. That question is not
+    answerable from the filesystem (see ``_incomplete_partial_names``) and is not asked here: a
+    partial that is GONE cannot be resumed over, and one that is still there still forces the clean
+    re-download.
+
+    Two passes, both on evidence this module already trusts:
+
+    * ours -- the ``.incomplete`` basenames the killed child held open, exempt from the grace
+      because a partial our own dead child wrote has no live writer;
+    * a partial outside that set which is BOTH older than *active_grace* and open by no live
+      process. The second pass is what the purge above cannot do: that one skips every blob outside
+      the ownership set whatever its age, so a partial left by an EARLIER crashed attempt survives
+      indefinitely and holds the repo-wide force. An injected (Unsloth) ``prepare_for_http_fn``
+      leaves the same gap, since it judges provenance by its own markers and never sees the
+      ownership set.
+
+    AGE IS NOT PROOF THAT A WRITER EXITED, which is why the second condition is there. A partial
+    can be older than any grace and still belong to a sibling that is paused, blocked on a slow
+    connection or waiting on a retry, and deleting it wastes that transfer and fails its rename.
+    ``_unowned_partials_safe_to_clear`` asks the open-file table instead, and returns ``None``
+    wherever that table cannot be read, in which case this pass does not run at all: on such a host
+    the caller forces exactly as it did before rather than widening the purge on age alone.
+
+    The result is passed to ``_clear_partials`` AS its ownership set, so the deletion is an explicit
+    whitelist rather than a grace: every condition has already been checked here.
+    """
+    if owned_incomplete_blobs:
+        _clear_partials(
+            repo_type, repo_id, cache_dir = cache_dir, active_grace = active_grace,
+            owned_incomplete_blobs = owned_incomplete_blobs,
+        )
+    clearable = _unowned_partials_safe_to_clear(
+        repo_type, repo_id, cache_dir, active_grace, owned_incomplete_blobs,
+    )
+    if clearable:
+        _clear_partials(
+            repo_type, repo_id, cache_dir = cache_dir, active_grace = active_grace,
+            owned_incomplete_blobs = clearable,
+        )
+    return _incomplete_partial_names(repo_type, repo_id, cache_dir)
+
+
 def _child_rss(pid: int) -> Optional[int]:
     """Resident bytes of child *pid*, or ``None`` when undeterminable.
 
@@ -1491,13 +1633,19 @@ def _run_download_attempt(
     message)`` (crash, no captured exception), ``("retryable_error", message)`` (transient, worth an
     HTTP retry), or ``("error", message)`` (deterministic Hub error). Tests monkeypatch this seam to
     avoid spawning."""
-    # Single-file: snapshot the on-disk partials BEFORE spawning so the watchdog follows only the blob(s)
-    # this child writes, not a sibling's. Snapshots stay repo-wide.
-    baseline_partials: Optional[set] = None
-    if kind == "file":
-        baseline_partials = set(
-            _active_incomplete_blob_sizes(repo_type, repo_id, params.get("cache_dir"))
-        )
+    # The on-disk partials BEFORE spawning, so a partial that appears afterwards is provably THIS
+    # child's and not a sibling's. Single-file downloads also scope the WATCHDOG with it (below);
+    # snapshots keep the repo-wide measurement, and use it only as ownership evidence for the
+    # Xet -> HTTP purge. Without it a snapshot has no ownership evidence at all wherever
+    # ``_child_open_incomplete_blobs`` cannot look (no psutil and no /proc, i.e. Windows), the
+    # killed child's own seconds-old partial is spared by the patient grace, and
+    # ``has_active_incomplete_blobs`` then forces a repo-wide clean re-download of every completed
+    # shard (issue #9094). Safe for a snapshot for the reason the diff is taken at all: the snapshot
+    # watchdog measures the WHOLE repo cache, so a fired stall is itself evidence that nothing --
+    # ours or a sibling's -- grew in this repo for a full stall_timeout.
+    baseline_partials: Optional[set] = set(
+        _active_incomplete_blob_sizes(repo_type, repo_id, params.get("cache_dir"))
+    )
     result_queue: Any = _CTX.Queue()
     proc = _CTX.Process(
         target = _download_child_entry,
@@ -1634,7 +1782,9 @@ def _run_download_attempt(
             xet_disabled = disable_xet,
             on_heartbeat = on_status,
             watch_new_partials_only = (kind == "file"),
-            baseline_incomplete_blobs = baseline_partials,
+            # Watchdog scope is unchanged: the baseline only narrows what is MEASURED in the
+            # single-file mode, and a snapshot must keep measuring the whole repo.
+            baseline_incomplete_blobs = baseline_partials if kind == "file" else None,
             child_pid = proc.pid,
         )
         while proc.is_alive():
@@ -2579,14 +2729,36 @@ def _download_with_xet_fallback(
             except Exception as e:
                 logger.debug("prepare_for_http failed for %s: %s", repo_id, e)
             # An unsafe partial that could not be cleared (locked / permission) would corrupt the blob on
-            # an HTTP resume: force a clean re-download instead.
+            # an HTTP resume: force a clean re-download instead. That force is REPO-WIDE, so spend one
+            # more BLOB-SCOPED clearance attempt first and force only for what genuinely survives it --
+            # a spared partial used to cost every completed shard in the repo (issue #9094).
             if has_active_incomplete_blobs(repo_type, repo_id, cache_dir = cache_dir):
-                logger.warning(
-                    "Unsafe partial for '%s' could not be cleared; forcing a clean "
-                    "HTTP re-download instead of an unsafe resume.", label
+                survivors = _clear_unsafe_partials_for_http(
+                    repo_type, repo_id, cache_dir = cache_dir,
+                    active_grace = max(stall_timeout or 0.0, DEFAULT_HTTP_STALL_TIMEOUT),
+                    owned_incomplete_blobs = owned_incomplete,
                 )
-                params = {**params, "force_download": True}
-                forced_clean_redownload = True
+                # ABSENCE is the only evidence accepted, exactly as at the latch below: an
+                # uninspectable cache (``None``) is not proof of a clear, and the repo must also be
+                # free of the dangling snapshot links the detector reads as active state, so the
+                # scoped path is taken only when the whole trigger has provably gone away.
+                cleared = (
+                    survivors is not None
+                    and not survivors
+                    and not has_active_incomplete_blobs(repo_type, repo_id, cache_dir = cache_dir)
+                )
+                if cleared:
+                    logger.info(
+                        "Unsafe partial for '%s' cleared; re-fetching only the affected file(s) "
+                        "and keeping every completed one.", label
+                    )
+                else:
+                    logger.warning(
+                        "Unsafe partial for '%s' could not be cleared; forcing a clean "
+                        "HTTP re-download instead of an unsafe resume.", label
+                    )
+                    params = {**params, "force_download": True}
+                    forced_clean_redownload = True
         elif disable_xet:
             # Re-read before EVERY later HTTP child, in both directions: a concurrent Xet downloader
             # can create a partial under the same blob name after a release (typically while this
