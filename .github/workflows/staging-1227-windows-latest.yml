@@ -16,10 +16,7 @@ defaults:
 jobs:
   test:
     runs-on: windows-latest
-    timeout-minutes: 30
-    env:
-      UNSLOTH_COMPILE_DISABLE: '1'
-      UNSLOTH_IS_PRESENT: '1'
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,6 +24,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
-      - run: python -m pip install pyyaml packaging
-      - run: PYTHONPATH=studio/backend python -m pytest studio/backend/tests -q || true
+      # The generated workflow installs Studio's requirements, which this
+      # repository does not have. This suite reads files and spawns one
+      # subprocess; it needs nothing else.
+      - run: python -m pip install "pytest>=8" pyyaml packaging
+      - run: python -m pytest tests/test_published_version_window.py -q --tb=short
