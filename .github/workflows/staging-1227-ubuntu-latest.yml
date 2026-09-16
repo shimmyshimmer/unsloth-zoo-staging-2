@@ -1,0 +1,31 @@
+name: "staging-1227 ubuntu-latest"
+on:
+  push:
+    branches: ["pr-1227-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # The generated workflow installs Studio's requirements, which this
+      # repository does not have. This suite reads files and spawns one
+      # subprocess; it needs nothing else.
+      - run: python -m pip install "pytest>=8" pyyaml packaging
+      - run: python -m pytest tests/test_published_version_window.py -q --tb=short
