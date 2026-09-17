@@ -24,11 +24,13 @@ __all__ = [
 
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import ast
+import contextlib
 import hashlib
 import io
 import inspect
 import re
 import importlib
+import importlib.machinery
 import importlib.util
 import numpy as np
 import os
@@ -40,6 +42,7 @@ import logging
 import tempfile
 import sys
 import textwrap
+import threading
 import tokenize
 from .utils import (
     Version,
@@ -1244,14 +1247,229 @@ def _bytecode_would_be_used(function_location, bytecode_location):
     return mtime == int(source.st_mtime) & 0xFFFFFFFF and size == source.st_size & 0xFFFFFFFF
 pass
 
-def _remove_compiled_cache_bytecode(function_location):
-    """Remove this rank's pyc before importing source we just rewrote.
+def _moe_utils_copy_is_importable(folder):
+    """Whether it is safe to expose `folder` to a generated module's import.
 
-    Only called when the bytes changed, the only time the pyc can be stale.
-    An unlink failure is fatal only when the pyc would really be used: on
-    Windows os.remove raises PermissionError whenever a scanner or other
-    interpreter holds the file, and raising on that forced the whole group into
-    tempfile recovery. A pyc CPython would still accept still fails over.
+    Imported lazily and defensively: moe_utils lives under temporary_patches and
+    pulls in torch, so a hard import at module scope would reorder this file's
+    dependencies. A folder is only trusted when moe_utils itself vouches for the
+    copy in it, and an unreadable or unimportable helper means untrusted. That
+    call also drops any pyc sitting beside the copy, since a bare import prefers
+    one and an unchecked-hash pyc runs without the source being consulted at all.
+    """
+    if not folder:
+        return False
+    # A verbatim moe_utils.py does not settle it: `from moe_utils import ...`
+    # resolves BY NAME, so a planted moe_utils/ package or moe_utils.so in the
+    # same directory is what Python picks, exactly as for a generated module.
+    # Same check, same reasoning, one name over.
+    try:
+        _reject_shadowing_import_candidates(folder, "moe_utils")
+    except Exception:
+        return False
+    try:
+        # Absolute, not `.temporary_patches.moe_utils`: transformers finds
+        # relative imports with a regex and joins the raw dotted capture onto the
+        # directory, so the relative spelling makes custom_object_save try to
+        # open unsloth_zoo/temporary_patches.moe_utils.py and fail every
+        # remote-code checkpoint save. See tests/test_relative_imports_resolve.py.
+        from unsloth_zoo.temporary_patches.moe_utils import cached_copy_is_importable
+    except Exception:
+        return False
+    try:
+        return bool(cached_copy_is_importable(folder))
+    except Exception:
+        return False
+
+
+def _drop_untrusted_cache_from_sys_path(folders):
+    """Remove every sys.path entry that resolves to one of `folders`.
+
+    By entry, not by string: the folder we refuse is usually the relative
+    "unsloth_compiled_cache" while the entry on the path can be the absolute
+    form, or the other way round, and either resolves to the same directory.
+
+    The working directory is never dropped, however it is spelled. With
+    UNSLOTH_COMPILE_LOCATION="." the cache IS the working directory, so "", "."
+    and its absolute form all resolve to the target and filtering would delete
+    the user's own import path for every unrelated local module, permanently and
+    for a cache they did not choose to put there. Losing the refusal here costs
+    nothing that matters: the name block in the caller is what actually stops
+    the planted helper from being imported, and the path filter only narrows the
+    surface around it.
+    """
+    targets = set()
+    for folder in folders:
+        try:
+            targets.add(os.path.realpath(folder))
+        except Exception:
+            continue
+    try:
+        targets.discard(os.path.realpath(os.getcwd()))
+    except Exception:
+        pass
+    if not targets:
+        return
+    kept = []
+    for entry in sys.path:
+        try:
+            resolved = os.path.realpath(entry) if isinstance(entry, str) else None
+        except Exception:
+            resolved = None
+        if resolved is None or resolved not in targets:
+            kept.append(entry)
+    sys.path[:] = kept
+
+
+_MOE_UTILS_BLOCK_LOCK = threading.Lock()
+_MOE_UTILS_BLOCK = {"depth": 0, "previous": None, "was_present": False}
+
+
+@contextlib.contextmanager
+def _untrusted_cache_kept_out_of_imports(*folders):
+    """Keep a cache directory we do not vouch for out of a generated module's imports.
+
+    Declining to PREPEND an untrusted folder is not enough, because it can
+    already be on sys.path -- and we are the ones who put it there. Every
+    generated module carries _license_header, whose prologue runs
+    `sys.path.insert(0, UNSLOTH_COMPILE_LOCATION)` above the module's own
+    `from moe_utils import ...`. So the module re-exposes the persistent cache
+    to itself mid-exec, no matter what sys.path looked like on entry, and the
+    entry then outlives the call because nothing here put it there to restore.
+    Stripping path-equivalent entries on both ends closes that leak; blocking
+    the NAME is what closes the window the prologue opens inside the exec.
+    `None` in sys.modules makes `from moe_utils import ...` raise
+    ModuleNotFoundError before any file is opened, which is exactly what that
+    bare import's `except Exception: pass` is written to absorb -- it costs the
+    backend names, as it already does whenever the copy is missing.
+
+    Both the active compile folder and UNSLOTH_COMPILE_LOCATION are passed in:
+    after a recovery they differ, and the prologue names the persistent one, so
+    running from node-local temp does not put the persistent cache out of reach.
+
+    Untrusted is a genuinely anomalous state, never the ordinary run: a folder
+    with no moe_utils.py in it is trusted (nothing is importable from it), so
+    this only engages when a foreign copy, a shadowing moe_utils/ or extension,
+    or an undeletable pyc is actually sitting there.
+    """
+    untrusted = [
+        folder for folder in dict.fromkeys(folders)
+        if folder and not _moe_utils_copy_is_importable(folder)
+    ]
+    if not untrusted:
+        yield
+        return
+    _drop_untrusted_cache_from_sys_path(untrusted)
+    # Nest by depth under one lock, rather than each guard saving and restoring
+    # for itself. Two overlapping guards that each keep their own copy get this,
+    # measured on the real guard: the inner one saves the outer one's `None`, the
+    # outer exits and REMOVES the entry while the inner is still running, so the
+    # inner block is unprotected for the rest of its body, and then the inner
+    # exit restores that `None` permanently and every later legitimate
+    # `import moe_utils` in the process dies on it. Only the outermost guard
+    # touches sys.modules, so neither half can happen.
+    with _MOE_UTILS_BLOCK_LOCK:
+        if _MOE_UTILS_BLOCK["depth"] == 0:
+            _MOE_UTILS_BLOCK["was_present"] = "moe_utils" in sys.modules
+            _MOE_UTILS_BLOCK["previous"] = sys.modules.get("moe_utils")
+            sys.modules["moe_utils"] = None
+        _MOE_UTILS_BLOCK["depth"] += 1
+    try:
+        yield
+    finally:
+        with _MOE_UTILS_BLOCK_LOCK:
+            _MOE_UTILS_BLOCK["depth"] -= 1
+            if _MOE_UTILS_BLOCK["depth"] == 0:
+                if _MOE_UTILS_BLOCK["was_present"]:
+                    sys.modules["moe_utils"] = _MOE_UTILS_BLOCK["previous"]
+                else:
+                    sys.modules.pop("moe_utils", None)
+                _MOE_UTILS_BLOCK["previous"] = None
+                _MOE_UTILS_BLOCK["was_present"] = False
+        _drop_untrusted_cache_from_sys_path(untrusted)
+
+
+def _reject_shadowing_import_candidates(compile_folder, name):
+    """Refuse a cache entry that would win the import over the verified file.
+
+    The digest is checked against `<name>.py`, but import_module() resolves by
+    name, and three things beat a source module of that name. None of them is
+    raced: the file can simply be sitting there, and nothing here ever creates
+    one, so its presence is reason enough to stop.
+
+    A directory is one: a regular package `<name>/__init__.py` is found first.
+
+    An extension module is the second, and it outranks even the package.
+    FileFinder's loaders are `extension, source, bytecode`, so on this
+    interpreter `<name>.cpython-313-x86_64-linux-gnu.so`, `<name>.abi3.so` and
+    `<name>.so` are all tried before `<name>.py` -- and a shared library is loaded
+    and run by the dynamic linker, with no source for any digest to cover.
+
+    A sourceless `<name>.pyc` sitting directly in the directory (the legacy
+    layout, not `__pycache__/`) is the third. It loses to `<name>.py`, so it only
+    decides an import when no source is there -- but that is exactly the case
+    both this and cached_copy_is_importable() used to treat as "nothing can be
+    imported from here, so nothing needs rejecting". SourcelessFileLoader then
+    runs marshalled code with no source at all, which is strictly worse than the
+    planted-source case the digest covers.
+
+    Both suffix lists are read from importlib.machinery rather than hardcoded, so
+    this stays right on Windows (.pyd) and on a free-threaded or differently
+    tagged build.
+    """
+    # A cache location that is not a real directory is refused outright. Every
+    # check below asks the filesystem, but the import is resolved by the whole
+    # import machinery, and zipimport claims any sys.path entry that is a ZIP
+    # archive. A file named `unsloth_compiled_cache` that is really a zip passes
+    # every isdir/isfile check here and still serves `moe_utils` out of the
+    # archive. See cached_copy_is_importable for the reproduction.
+    if os.path.exists(compile_folder) and not os.path.isdir(compile_folder):
+        raise RuntimeError(
+            f"Unsloth: Refusing to import {name} because {compile_folder} exists "
+            f"and is not a directory, so what the import system resolves there is "
+            f"not what was verified here."
+        )
+    candidate = os.path.join(compile_folder, name)
+    if os.path.isdir(candidate):
+        raise RuntimeError(
+            f"Unsloth: Refusing to import {name} because {candidate} would be "
+            f"imported instead of the verified source beside it."
+        )
+    shadowing = [
+        (suffix, "an extension module")
+        for suffix in importlib.machinery.EXTENSION_SUFFIXES
+    ] + [
+        (suffix, "sourceless bytecode")
+        for suffix in importlib.machinery.BYTECODE_SUFFIXES
+    ]
+    for suffix, kind in shadowing:
+        shadow = os.path.join(compile_folder, name + suffix)
+        if os.path.isfile(shadow):
+            raise RuntimeError(
+                f"Unsloth: Refusing to import {name} because {shadow} is "
+                f"{kind} and would be loaded instead of the verified "
+                f"source beside it."
+            )
+
+
+def _remove_compiled_cache_bytecode(function_location):
+    """Remove this rank's pyc before importing verified source.
+
+    Called before EVERY verified import, not only after a rewrite. The digest
+    covers the .py, but CPython can execute an unchecked-hash pyc without ever
+    consulting the source beside it, so a cache holding the expected source and
+    a planted pyc verifies clean and still runs foreign code.
+    A pyc that survives the unlink is fatal whatever its invalidation mode says.
+    The mode cannot be trusted here: an attacker who writes the pyc also writes
+    its header, so a CHECKED_HASH entry can carry source_hash(expected source)
+    beside a foreign marshalled body, and CPython validates that header, accepts
+    it, and runs the body. Reading the flags to decide would exempt exactly the
+    case being defended against.
+
+    On Windows os.remove raises PermissionError whenever a scanner or another
+    interpreter holds the file, so this does turn some benign cases fatal. That
+    is a recovery, not a crash: the caller treats the failure as an unwritable
+    cache and falls back to a node-local temp directory.
     """
     try:
         bytecode_location = importlib.util.cache_from_source(function_location)
@@ -1262,35 +1480,152 @@ def _remove_compiled_cache_bytecode(function_location):
     except FileNotFoundError:
         pass
     except OSError as error:
-        if _bytecode_would_be_used(function_location, bytecode_location):
+        if os.path.isfile(bytecode_location):
             raise RuntimeError(
-                f"Unsloth: Cannot remove stale bytecode for {function_location}: "
-                f"{error}."
+                f"Unsloth: Cannot remove bytecode for {function_location}: "
+                f"{error}. Refusing to import the source while bytecode we did "
+                f"not write survives beside it."
             ) from error
-        logger.warning_once(
-            f"Unsloth: Cannot remove bytecode for {function_location}: {error}. "
-            "Continuing, since the rewritten source no longer matches it."
-        )
 pass
 
-def _verify_cache_digest_under_lock(function_location, expected_digest):
-    """Ensure the locked file still matches the collectively verified bytes."""
-    if expected_digest is None:
-        return
+def _replace_compiled_cache_file(function_location, new_write_bytes):
+    """Land the generated bytes by replacing the path, not by writing into it.
+
+    On POSIX os.replace needs the directory, not the file, so this gets the
+    generated source onto a cache file whose own mode refuses an in-place write:
+    a leftover read-only file, or content that arrived with the working
+    directory rather than from us. Atomic, so a reader that is not holding our
+    lock never observes a half-written module.
+
+    Windows is weaker here. MoveFileEx honours the destination's ACL and its
+    read-only attribute, and any handle opened without FILE_SHARE_DELETE blocks
+    it, so there the replacement can still fail. That is not a hole: the caller
+    treats the failure as unwritable and recovers into a node-local temp cache
+    rather than importing the file.
+
+    The result is 0644 rather than mkstemp's 0600. Owner-only would be tighter,
+    but it is also sticky, and a group-shared or bind-mounted cache directory is
+    a real deployment: narrowing it here would push every other principal off
+    the shared cache permanently, for a file whose contents are generated from
+    installed libraries. Never group- or world-writable, which is the part that
+    matters, since that is what would let the file be planted again.
+    """
+    directory = os.path.dirname(function_location) or "."
+    descriptor, temporary_location = tempfile.mkstemp(
+        prefix = f".{os.path.basename(function_location)}.", suffix = ".tmp",
+        dir = directory,
+    )
+    os.close(descriptor)
+    try:
+        _write_bytes_durably(temporary_location, new_write_bytes)
+        os.chmod(temporary_location, 0o644)
+        os.replace(temporary_location, function_location)
+    except BaseException:
+        try:
+            os.remove(temporary_location)
+        except OSError:
+            pass
+        raise
+pass
+
+def _write_bytes_durably(location, new_write_bytes):
+    """Write and fsync. Buffered, so a short write is retried rather than lost."""
+    with open(location, "wb") as file:
+        file.write(new_write_bytes)
+        file.flush()
+        os.fsync(file.fileno())
+pass
+
+def _write_compiled_cache_file(function_location, new_write_bytes):
+    """Write the generated bytes, in place when the file allows it."""
+    try:
+        _write_bytes_durably(function_location, new_write_bytes)
+    except OSError:
+        _replace_compiled_cache_file(function_location, new_write_bytes)
+pass
+
+def _compiled_cache_file_is_foreign(function_location, new_write_bytes):
+    """Whether the cache file holds bytes other than the ones we just generated.
+
+    Not a claim about who wrote them: our own output from an older version of
+    this library reads the same as anything else, and both are equally unsafe to
+    keep after a rewrite we could not land. An absent file has nothing to
+    import, so it is not foreign. Unreadable is: bytes we cannot check are bytes
+    we cannot vouch for.
+    """
+    try:
+        with open(function_location, "rb") as file:
+            return file.read() != new_write_bytes
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+pass
+
+def _verified_cache_source(function_location, expected_digest):
+    """The bytes that passed the digest, read once, for the caller to EXECUTE.
+
+    The last gate before the file runs, so it applies in every process, not only
+    a distributed one: a cache file that changed between the write and the import
+    is never the file we generated.
+
+    Returning the bytes is the point. Verifying one open and then letting the
+    import machinery reopen the path leaves a window between the two, and the
+    cache lock is cooperative, so it constrains our own ranks and not whoever
+    planted the file: a replacement landing in that window executed without ever
+    matching the digest. Callers compile and exec what comes back from here, so
+    the bytes that ran are the bytes that were checked.
+    """
     with open(function_location, "rb") as file:
-        actual_digest = hashlib.sha256(file.read()).hexdigest()
+        source = file.read()
+    if expected_digest is None:
+        return source
+    actual_digest = hashlib.sha256(source).hexdigest()
     if actual_digest != expected_digest:
         raise RuntimeError(
             f"Unsloth: Compiled cache file {function_location} changed after "
             f"verification ({expected_digest[:12]} -> {actual_digest[:12]})."
         )
+    return source
+
+
+def _exec_verified_source(source, file_location, module_name):
+    """Build and run a module from `source`, never reopening `file_location`.
+
+    The path is still handed to compile() and to the spec, so tracebacks, the
+    module's __file__ and inspect.getsource all read normally; it is simply never
+    the thing that gets read back.
+
+    Absolute, because the compile folder is relative by default
+    ("unsloth_compiled_cache") and co_filename is resolved against the working
+    directory at READ time, not at compile time. importlib.import_module used to
+    hand the loader an absolute path, so leaving it relative silently downgraded
+    every traceback and inspect.getsource to something that stops working the
+    moment the process chdirs.
+    """
+    try:
+        file_location = os.path.abspath(file_location)
+    except Exception:
+        pass
+    spec = importlib.util.spec_from_file_location(module_name, file_location)
+    new_module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = new_module
+    try:
+        exec(compile(source, file_location, "exec"), new_module.__dict__)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return new_module
 pass
 
 def _compiled_cache_decision(function_location, write_new_source, overwrite):
-    """Rank 0's write decision, plus a digest of the bytes it will import."""
+    """Rank 0's write decision, plus a digest of the bytes it will import.
+
+    The digest is not only a cross-rank agreement check. A single process reads
+    the cache back under the import lock against this digest too, so bytes that
+    replaced the ones we wrote are not imported and executed.
+    """
     should_write = overwrite or not os.path.isfile(function_location)
-    if not torch_distributed_is_initialized():
-        return should_write, None
     if should_write:
         return True, hashlib.sha256(write_new_source.encode("utf-8")).hexdigest()
     # Digest the file, not write_new_source: UNSLOTH_COMPILE_OVERWRITE=0 keeps an
@@ -1674,10 +2009,7 @@ def create_new_function(
                         need_write = f.read() != new_write_bytes
 
                 if need_write:
-                    with open(function_location, "wb", buffering=0) as file:
-                        file.write(new_write_bytes)
-                        file.flush()
-                        os.fsync(file.fileno())
+                    _write_compiled_cache_file(function_location, new_write_bytes)
             # Did the bytes change, which is what makes a pyc stale.
             # overwrite=True means "you may rewrite", not "the content differs".
             return need_write
@@ -1690,7 +2022,19 @@ def create_new_function(
                 )
             # The write may have landed partially, so assume it changed:
             # over-invalidating costs a recompile, under-invalidating runs
-            # stale bytecode.
+            # stale bytecode. That reasoning only covers bytes we generated.
+            # Anything else on disk is not ours to keep: reporting success falls
+            # straight through to importing and executing it, so fail instead
+            # and let the caller recover into a directory it can write. For a
+            # persistent cache that recovery is a node-local temp cache, so the
+            # problem is reported without breaking a working setup; a cache that
+            # is already node-local temp has nowhere left to go and raises.
+            # The lock is gone by now, so this classification is advisory: a
+            # concurrent writer can land the same bytes (not foreign, we carry
+            # on) or different ones (foreign, we recover). Both are safe, and
+            # the digest re-read under the import lock is the real gate.
+            if _compiled_cache_file_is_foreign(function_location, new_write_bytes):
+                raise
             return True
 
     pass
@@ -1837,19 +2181,36 @@ def create_new_function(
         old_path = None
         target_name = os.path.join(compile_folder, f"{name}.py")
         lock = get_lock(target_name)
-        # Put the verified cache first even when it already appears later.
-        if not sys.path or sys.path[0] != compile_folder:
+        # Put the verified cache first even when it already appears later, but
+        # only once the moe_utils sitting in it is this package's own file. The
+        # generated module's `from moe_utils import ...` resolves off this entry,
+        # and it is a bare import inside `except Exception: pass`, so an
+        # installation that could not replace a foreign copy -- or a shared-cache
+        # writer that changed it afterwards -- otherwise got its top level
+        # executed here, on the ordinary path, with the failure swallowed. The
+        # recovery path below had this check; this one did not.
+        if _moe_utils_copy_is_importable(compile_folder) and (
+            not sys.path or sys.path[0] != compile_folder
+        ):
             old_path = list(sys.path)
             sys.path[:] = [path for path in sys.path if path != compile_folder]
             sys.path.insert(0, compile_folder)
         try:
             with lock:
-                # Try standard import
-                _verify_cache_digest_under_lock(target_name, expected_digest)
-                if rewrote_cache_file:
-                    _remove_compiled_cache_bytecode(target_name)
+                # Read and verify once, then execute THOSE bytes. Handing the
+                # name to importlib instead reopened the path, and the window
+                # between the two is not covered by this lock: it is cooperative,
+                # so it binds our own ranks and not whoever planted the file.
+                source = _verified_cache_source(target_name, expected_digest)
+                _remove_compiled_cache_bytecode(target_name)
+                # Still checked, because the module's OWN imports resolve by name
+                # off compile_folder even though this one no longer does.
+                _reject_shadowing_import_candidates(compile_folder, name)
                 importlib.invalidate_caches()
-                new_module = importlib.import_module(name)
+                with _untrusted_cache_kept_out_of_imports(
+                    compile_folder, UNSLOTH_COMPILE_LOCATION,
+                ):
+                    new_module = _exec_verified_source(source, target_name, name)
                 return new_module, old_path
         except Exception as e:
             if old_path is not None:
@@ -1874,33 +2235,39 @@ def create_new_function(
         # `from moe_utils import ...`, so without this the load reports success
         # with every backend name undefined. Both folders: recovery switches to
         # node-local temp, but the helper sits next to the persistent cache.
-        search_paths = [compile_folder]
-        if UNSLOTH_COMPILE_LOCATION not in search_paths:
-            search_paths.append(UNSLOTH_COMPILE_LOCATION)
-        old_path = list(sys.path)
-        sys.path[:] = search_paths + [p for p in sys.path if p not in search_paths]
-        try:
-            return _exec_module_under_lock(
-                lock, file_location, module_name, expected_digest,
-            )
-        finally:
-            sys.path[:] = old_path
+        # A directory only goes on the path if the moe_utils.py sitting in it is
+        # this package's own file. `from moe_utils import ...` inside a generated
+        # module is a bare, unverified import wrapped in `except Exception: pass`,
+        # so a planted copy here would be imported and its top level executed with
+        # the failure swallowed -- the same copy _load_cached_moe_utils_module()
+        # already refuses to load for itself. Dropping the directory costs the
+        # backend names, which that import is written to survive losing.
+        search_paths = [
+            folder
+            for folder in dict.fromkeys([compile_folder, UNSLOTH_COMPILE_LOCATION])
+            if _moe_utils_copy_is_importable(folder)
+        ]
+        # Outside the sys.path juggling below, so its restore cannot put back an
+        # entry for a folder this refused.
+        with _untrusted_cache_kept_out_of_imports(
+            compile_folder, UNSLOTH_COMPILE_LOCATION,
+        ):
+            old_path = list(sys.path)
+            sys.path[:] = search_paths + [p for p in sys.path if p not in search_paths]
+            try:
+                return _exec_module_under_lock(
+                    lock, file_location, module_name, expected_digest,
+                )
+            finally:
+                sys.path[:] = old_path
 
     pass
 
     def _exec_module_under_lock(lock, file_location, module_name, expected_digest):
         with lock:
-            _verify_cache_digest_under_lock(file_location, expected_digest)
-            if rewrote_cache_file:
-                _remove_compiled_cache_bytecode(file_location)
-            spec = importlib.util.spec_from_file_location(module_name, file_location)
-            new_module = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = new_module
-            try:
-                spec.loader.exec_module(new_module)
-            except Exception:
-                sys.modules.pop(module_name, None)
-                raise
+            source = _verified_cache_source(file_location, expected_digest)
+            _remove_compiled_cache_bytecode(file_location)
+            new_module = _exec_verified_source(source, file_location, module_name)
         return new_module
 
     pass
@@ -1981,6 +2348,15 @@ def create_new_function(
         # Restore original sys.path if we modified it
         if old_path is not None:
             sys.path[:] = old_path
+        # The snapshot above predates this call, so it can carry an entry a
+        # generated module's prologue left behind on an earlier one. Re-check
+        # rather than trust it: a folder is only dropped if it is still untrusted
+        # now.
+        _drop_untrusted_cache_from_sys_path([
+            folder
+            for folder in dict.fromkeys([compile_folder, UNSLOTH_COMPILE_LOCATION])
+            if folder and not _moe_utils_copy_is_importable(folder)
+        ])
 
     if new_module is None:
         raise ImportError(
