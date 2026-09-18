@@ -1,0 +1,52 @@
+name: "xdiff2-1255 base windows-latest"
+on:
+  push:
+    branches: ["pr-1255-base-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_ZOO_DISABLE_GPU_INIT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -c "import sys,platform,os,importlib.machinery as m;print(platform.platform());print('machine',platform.machine());print('uid',getattr(os,'geteuid',lambda:'n/a')());print('name',os.name);print('SOURCE_SUFFIXES',m.SOURCE_SUFFIXES);print('has_fchmod',hasattr(os,'fchmod'))"
+      - run: python -m pip install -e . pytest pytest-asyncio pytest-timeout && python -m pip install --no-deps git+https://github.com/unslothai/unsloth
+      - run: python -m pip install torch peft
+      - name: targeted tests
+        run: |
+          echo "=== ARM base / windows-latest / targeted ==="
+          python -m pytest tests/test_compiled_cache_fail_closed.py tests/test_compiled_cache_collective.py tests/test_compile_cache_security.py tests/test_moe_fused_lora_merge_layout.py -q -rs -rf --tb=short -p no:cacheprovider --timeout=300 > target_out.txt 2>&1 || true
+          cat target_out.txt
+      - name: default selection
+        run: |
+          echo "=== ARM base / windows-latest / default selection ==="
+          python -m pytest tests -q --tb=no -rf -p no:cacheprovider --timeout=300 > full_out.txt 2>&1 || true
+          tail -n 200 full_out.txt
+          echo "=== FAILURE SET ==="
+          grep -E "^(FAILED|ERROR) " full_out.txt | sort || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: base2-windows-latest-out
+          path: |
+            target_out.txt
+            full_out.txt
+          if-no-files-found: warn
