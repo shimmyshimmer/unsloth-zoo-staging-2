@@ -18,6 +18,7 @@ from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import ast
 import functools
 import os
+import stat
 import torch
 import torch.nn as nn
 import torch.nn.init as init
@@ -1437,6 +1438,53 @@ def _gpt_oss_cache_locations():
     return out
 
 
+def _gpt_oss_cache_location_is_trusted(loc):
+    """Whether this process may write the flavor marker into `loc`.
+
+    The temp candidate is a fully predictable path (`/tmp/unsloth_compiled_cache` by
+    default), and nothing stops another local user creating it first. `os.path.isdir`
+    answers "does it exist", which an attacker satisfies with one mkdir, not "is it
+    ours".
+
+    Deliberately weaker than `compile_cache._is_trusted_directory`, and only here:
+    that one gates LOADING executable artifacts, so it walks every ancestor and
+    refuses any group write. This gates writing a seven-byte flavor string through an
+    O_NOFOLLOW descriptor next to a compiled module the library itself writes 0644
+    into the same directory. Refusing a group-writable cache would therefore buy
+    nothing (a group member can already replace the module) while silently disabling
+    flavor invalidation for every umask 002 machine, which is the default on plenty
+    of shared systems and would leave a stale module reinstalling the wrong
+    router/experts layout.
+    """
+    try:
+        directory_stat = os.lstat(loc)
+    except FileNotFoundError:
+        return True   # a location we are about to create ourselves
+    except Exception:
+        return False
+    try:
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            return False
+        if os.name != "posix":
+            return True
+        if directory_stat.st_uid != os.geteuid():
+            return False
+        # World-writable is never a deliberate sharing choice, group-writable is.
+        return not (directory_stat.st_mode & 0o002)
+    except Exception:
+        return False
+pass
+
+
+def _gpt_oss_write_marker(loc, desired_flavor):
+    """Write the flavor marker without following a link out of `loc`."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(os.path.join(loc, _GPT_OSS_FLAVOR_MARKER), flags, 0o600)
+    with os.fdopen(descriptor, "w", encoding = "utf-8") as f:
+        f.write(desired_flavor)
+pass
+
+
 def _invalidate_gpt_oss_compiled_module():
     """Drop the cached compiled gpt_oss module (sys.modules + on-disk .py/.pyc) so it is
     rebuilt against the CURRENT router/experts classes. The single per-model-type file
@@ -1482,6 +1530,13 @@ def _sync_gpt_oss_compiled_flavor(desired_flavor):
             module_path = os.path.join(loc, _GPT_OSS_COMPILED_MODULE + ".py")
             if not os.path.isfile(module_path):
                 continue
+            if not _gpt_oss_cache_location_is_trusted(loc):
+                # We refuse to write a marker here, so any marker found is not ours,
+                # and the compiler applies no such gate when it imports the module
+                # next to it. Regenerate rather than trust what a rejected directory
+                # claims the flavor is.
+                mismatch = True
+                continue
             on_disk = None
             marker_path = os.path.join(loc, _GPT_OSS_FLAVOR_MARKER)
             if os.path.isfile(marker_path):
@@ -1498,10 +1553,13 @@ def _sync_gpt_oss_compiled_flavor(desired_flavor):
         for idx, loc in enumerate(locations):
             if idx != 0 and not os.path.isdir(loc):
                 continue
+            # Skip silently rather than write into a directory another user owns or
+            # can write, and never follow a link out of it.
+            if not _gpt_oss_cache_location_is_trusted(loc):
+                continue
             try:
                 os.makedirs(loc, exist_ok = True)
-                with open(os.path.join(loc, _GPT_OSS_FLAVOR_MARKER), "w", encoding = "utf-8") as f:
-                    f.write(desired_flavor)
+                _gpt_oss_write_marker(loc, desired_flavor)
             except Exception:
                 pass
     except Exception:
