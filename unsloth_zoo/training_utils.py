@@ -264,23 +264,52 @@ def _iter_configs(config):
                 stack.append(sub)
 
 
+# Sentinel for "this config had no use_cache at all", so restore_use_cache can
+# tell that apart from a config that genuinely held None.
+#
+# A class, not `object()`: the record lives on the model, and `copy.deepcopy`
+# and `pickle` both treat a class as atomic while giving a bare instance a new
+# identity. With an instance, deepcopying a prepared model (TRL builds its
+# reference model that way) or a torch.save/load round trip made the identity
+# check fail, so restore wrote the opaque sentinel itself into cfg.use_cache
+# and the config stopped being JSON serializable.
+class _ABSENT:
+    """Marker type; never instantiated."""
+
+
 def disable_use_cache(model):
     """Set use_cache = False on every config of the model. KV cache is unused
     under gradient checkpointing. Original values are remembered on the model
-    the first time so restore_use_cache can undo this for inference."""
+    so restore_use_cache can undo this for inference."""
     config = getattr(model, "config", None)
     if config is None:
         return
     originals = getattr(model, "_unsloth_use_cache_originals", None)
-    record = originals is None
-    if record:
+    if originals is None:
         originals = []
+    # Record by identity rather than only on the first call. A config first
+    # reached on a later call -- a sub-config attached after training started,
+    # or a config swapped in while the model was prepared -- used to be
+    # disabled without being recorded, so restore_use_cache could never undo
+    # it and the config kept use_cache = False for good.
+    recorded = {id(cfg) for cfg, _ in originals}
     for cfg in _iter_configs(config):
-        if getattr(cfg, "use_cache", None):
-            if record:
-                originals.append((cfg, cfg.use_cache))
-            cfg.use_cache = False
-    if record and originals:
+        has_use_cache = hasattr(cfg, "use_cache")
+        if has_use_cache and not cfg.use_cache:
+            continue                      # already disabled, nothing to record
+        if id(cfg) not in recorded:
+            # _ABSENT marks a config that never had the attribute, so restore
+            # removes it again rather than inventing a value. A config already
+            # in the record keeps its first baseline.
+            originals.append((cfg, cfg.use_cache if has_use_cache else _ABSENT))
+            recorded.add(id(cfg))
+        # Set it even when the config never declared one. A model whose forward
+        # reads self.config.use_cache then raises AttributeError under gradient
+        # checkpointing instead of running: transformers 5 sub-configs do not
+        # inherit a default, and stepfun-ai/Step-3.7-Flash ships a
+        # Step3p7TextConfig with no use_cache at all.
+        cfg.use_cache = False
+    if originals:
         try:
             model._unsloth_use_cache_originals = originals
         except Exception:
@@ -293,7 +322,13 @@ def restore_use_cache(model):
     disabled. The record is kept so disable_use_cache can re-disable
     without re-recording when training resumes."""
     for cfg, value in getattr(model, "_unsloth_use_cache_originals", None) or ():
-        cfg.use_cache = value
+        if value is _ABSENT:
+            try:
+                delattr(cfg, "use_cache")
+            except Exception:
+                pass
+        else:
+            cfg.use_cache = value
 
 
 @torch.no_grad
