@@ -1209,6 +1209,12 @@ _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "logging_dir",
     "run_name",
     "adam_epsilon",
+    "teacher_model_name_or_path",
+    "gkd_beta",
+    "gkd_temperature",
+    "gkd_lmbda",
+    "gkd_chunk_size",
+    "gkd_skip_memory_preflight",
 )
 
 
@@ -1338,9 +1344,18 @@ class MLXTrainingConfig:
     logging_dir: str | None = None
     run_name: str | None = None
 
-    # Must stay last (positional binding). None keeps MLX's default (1e-8, same
-    # as HF). Adam family only: MLX Adafactor's eps is a 2-tuple.
+    # None keeps MLX's default (1e-8, same as HF). Adam family only: MLX
+    # Adafactor's eps is a 2-tuple.
     adam_epsilon: float | None = None
+
+    # GKD (unsloth_zoo/mlx/distill.py), inert while teacher_model_name_or_path
+    # is None. Appended LAST: the initializer binds positional args by order.
+    teacher_model_name_or_path: str | None = None
+    gkd_beta: float = 0.5
+    gkd_temperature: float = 1.0
+    gkd_lmbda: float = 0.0
+    gkd_chunk_size: int = 128
+    gkd_skip_memory_preflight: bool = False
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
@@ -4360,7 +4375,9 @@ class MLXTrainer:
                 value = (losses / weights).item() if total > 0 else 0.0
                 metrics[f"{prefix}loss"] = value
                 if metric_names is None:
-                    metrics[f"{prefix}perplexity"] = math.exp(min(value, 100))
+                    # exp(JSD) is not a perplexity.
+                    if not getattr(loss_fn, "_unsloth_gkd", False):
+                        metrics[f"{prefix}perplexity"] = math.exp(min(value, 100))
                 elif total > 0:
                     for name, metric in _preference_metric_values(
                         metric_names, metric_denominators, stats.tolist(),
@@ -5343,7 +5360,57 @@ class MLXTrainer:
         _vlm_ignore_token_ids = None
 
         if preference_kind:
+            if getattr(args, "teacher_model_name_or_path", None):
+                raise ValueError(
+                    "Unsloth: teacher_model_name_or_path (GKD) cannot be combined "
+                    "with a preference objective."
+                )
             loss_fn = None
+        elif getattr(args, "teacher_model_name_or_path", None):
+            # KD replaces the loss, so branch before the CCE/baseline selection.
+            import psutil as _psutil
+            from .distill import (
+                _model_logits, assert_tokenizers_compatible, build_gkd_loss_fn, load_teacher,
+            )
+            if is_vlm:
+                raise ValueError(
+                    "Unsloth: GKD distillation is text-only on MLX; the teacher "
+                    "would need the student's image preprocessing."
+                )
+            _teacher, _teacher_tok = load_teacher(args.teacher_model_name_or_path)
+            _probe = mx.zeros((1, 8), dtype=mx.int32)
+            _teacher_vocab = _model_logits(_teacher(_probe)).shape[-1]
+            assert_tokenizers_compatible(
+                self.tokenizer, _teacher_tok,
+                _model_logits(model(_probe)).shape[-1], _teacher_vocab,
+            )
+            _gkd_batch_size = args.per_device_train_batch_size
+            if self.eval_dataset is not None:
+                _gkd_batch_size = max(
+                    _gkd_batch_size,
+                    getattr(args, "per_device_eval_batch_size", None) or 0,
+                )
+            # Gradients and optimizer state are allocated later: Adam-family
+            # state is two float32 buffers per trainable parameter, and gradient
+            # accumulation holds the carried gradient beside the fresh one.
+            _live_grads = 2 if args.gradient_accumulation_steps > 1 else 1
+            _trainable_bytes = sum(
+                p.size * (_live_grads * p.itemsize + 8)
+                for _, p in tree_flatten(model.trainable_parameters())
+            )
+            loss_fn = build_gkd_loss_fn(
+                _teacher, args,
+                vocab_size = _teacher_vocab,
+                batch_size = _gkd_batch_size,
+                resident_bytes = mx.get_active_memory() + _trainable_bytes,
+                system_bytes = _psutil.virtual_memory().total,
+            )
+            use_cce = False
+            _main_print(
+                f"Unsloth: GKD off-policy distillation from "
+                f"{args.teacher_model_name_or_path} "
+                f"(beta={args.gkd_beta}, temperature={args.gkd_temperature})."
+            )
         elif is_vlm:
             processor = self._resolve_vlm_processor()
             # Backstop only; VLM collation already owns label masking.
@@ -7109,7 +7176,12 @@ class MLXTrainer:
                 self._last_eval_metrics = _metrics_before_eval
                 self.control.should_evaluate = False
                 return False
-            if ppl is None:
+            if ppl is None and getattr(loss_fn, "_unsloth_gkd", False):
+                _main_print(
+                    f"  Eval  {current_step}/{total_steps} | "
+                    f"Val Loss (GKD): {val_loss:.4f}"
+                )
+            elif ppl is None:
                 # No per-token likelihood to exponentiate.
                 _scores = self._last_eval_metrics or {}
                 _accuracy = _scores.get("eval_rewards/accuracies", float("nan"))
