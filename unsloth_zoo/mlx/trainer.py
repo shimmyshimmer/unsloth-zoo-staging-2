@@ -4277,6 +4277,8 @@ class MLXTrainer:
                 **adam_kwargs,
             )
         elif opt_name == "adam":
+            # torch Adam's weight_decay is coupled L2; MLX Adam has none.
+            self._coupled_weight_decay = float(wd or 0.0)
             optimizer = optim.Adam(
                 learning_rate=initial_lr,
                 bias_correction=True,
@@ -4300,6 +4302,7 @@ class MLXTrainer:
                     **adam_kwargs,
                 )
             else:
+                self._coupled_weight_decay = float(wd or 0.0)
                 optimizer = QuantizedMomentAdam(
                     learning_rate=initial_lr,
                     bias_correction=True,
@@ -4384,8 +4387,8 @@ class MLXTrainer:
         """Decoupled HF-parity decay on trainable non-bias/non-norm leaves.
 
         AdamW, Adafactor, Muon and Lion are built with ``weight_decay=0.0`` so
-        this owns the decay term, as HF does via ``param_groups``. SGD uses
-        coupled decay instead (``_apply_coupled_weight_decay``).
+        this owns the decay term, as HF does via ``param_groups``. SGD and Adam
+        use coupled decay instead (``_apply_coupled_weight_decay``).
         """
         wd = float(getattr(self, "_manual_weight_decay", 0.0) or 0.0)
         if wd <= 0:
