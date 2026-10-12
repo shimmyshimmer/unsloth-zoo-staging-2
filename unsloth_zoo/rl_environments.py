@@ -39,6 +39,7 @@ import os, gc, time, statistics
 import collections
 import numpy as np
 import signal
+import contextlib
 from contextlib import contextmanager
 from functools import wraps
 import threading
@@ -937,6 +938,34 @@ def _retry_eintr(func, *args):
             raise
 pass
 
+# Raising in these frames would skip time_limit's teardown (the with-body is
+# not entered yet, or contextlib is already unwinding it).
+_CONTEXTMANAGER_FRAMES = frozenset((
+    contextlib._GeneratorContextManager.__enter__.__code__,
+    contextlib._GeneratorContextManager.__exit__.__code__,
+))
+# After the deadline SIGALRM re-fires at this period until the body unwinds.
+_TIME_LIMIT_REFIRE_S = 0.01
+# Cleanup still unwinding the first timeout gets this long before re-fires raise.
+_TIME_LIMIT_CLEANUP_GRACE_S = 1.0
+
+class _TimeLimitExceeded(BaseException):
+    # Raised by the re-fires: `except Exception` in generated code catches the
+    # first TimeoutError but not this. time_limit turns it into TimeoutError.
+    pass
+
+def _timeout_unwinding():
+    # True while a timeout is still running finally / except / __exit__ blocks
+    # on its way out: re-fires must not cut that cleanup short.
+    exc = sys.exc_info()[1]
+    for _ in range(32):
+        if exc is None:
+            return False
+        if isinstance(exc, (TimeoutError, _TimeLimitExceeded)):
+            return True
+        exc = exc.__context__
+    return False
+
 @contextmanager
 def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
     """
@@ -965,10 +994,25 @@ def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
     deadline = seconds if prev_remaining <= 0.0 else min(seconds, prev_remaining)
 
     fired = False  # set by our handler
+    fired_at = 0.0
+    stopping = False
 
     def _handler(signum, frame):
-        nonlocal fired
+        nonlocal fired, fired_at
+        if stopping:
+            return
+        # Keep firing until the body unwinds: code that swallows the TimeoutError
+        # (a model-written strategy with a bare except, called in a loop) would
+        # otherwise never stop, since a one-shot alarm fires only once.
+        signal.setitimer(signal.ITIMER_REAL, _TIME_LIMIT_REFIRE_S)
+        if frame is not None and frame.f_code in _CONTEXTMANAGER_FRAMES:
+            return
+        if fired:
+            if _timeout_unwinding() and time.monotonic() - fired_at < _TIME_LIMIT_CLEANUP_GRACE_S:
+                return
+            raise _TimeLimitExceeded()
         fired = True
+        fired_at = time.monotonic()
         # include the intended arming deadline for debugging
         raise TimeoutError(f"Timed out after {deadline:g}s")
 
@@ -984,7 +1028,10 @@ def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
 
         _retry_eintr(signal.setitimer, signal.ITIMER_REAL, deadline)
         yield
+    except _TimeLimitExceeded:
+        raise TimeoutError(f"Timed out after {deadline:g}s") from None
     finally:
+        stopping = True
         # Make teardown atomic wrt SIGINT and robust to EINTR
         old_sigint = signal.getsignal(signal.SIGINT)
         try:
@@ -1081,6 +1128,23 @@ pass
 
 _VALID_START_METHODS = frozenset({"fork", "spawn", "forkserver"})
 
+def _stop_generated_code_at_deadline(value, deadline, seconds):
+    # A strategy from create_locked_down_function can swallow the TimeoutError
+    # raised inside it while its caller keeps looping; checking around each
+    # call raises it in the caller instead.
+    if not (isinstance(value, types.FunctionType) and value.__code__.co_filename == "<user_code>"):
+        return value
+
+    @wraps(value)
+    def guarded(*args, **kwargs):
+        if time.monotonic() < deadline:
+            result = value(*args, **kwargs)
+            if time.monotonic() < deadline:
+                return result
+        raise TimeoutError(f"Timed out after {seconds:g}s")
+    return guarded
+pass
+
 def execute_with_time_limit(
     seconds: float,
     *,
@@ -1131,6 +1195,9 @@ def execute_with_time_limit(
         @wraps(func)
         def wrapper(*args, **kwargs) -> T:
             if effective_backend == "signal":
+                deadline = time.monotonic() + seconds
+                args = tuple(_stop_generated_code_at_deadline(a, deadline, seconds) for a in args)
+                kwargs = {k: _stop_generated_code_at_deadline(v, deadline, seconds) for k, v in kwargs.items()}
                 with time_limit(seconds):
                     return func(*args, **kwargs)
             elif effective_backend == "process":
