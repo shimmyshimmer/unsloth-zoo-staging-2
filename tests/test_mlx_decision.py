@@ -396,3 +396,30 @@ def test_folder_keyword_still_loads(tmp_path):
     # Callers written against the Laya-only loader pass the checkpoint as folder=.
     with pytest.raises(ValueError, match = "not a decision model"):
         load_decision_model(folder = tmp_path)
+
+
+def test_records_without_encoded_clips_do_not_need_pyav(monkeypatch):
+    import sys
+
+    # As if PyAV were not installed: image-only and already decoded clips are read without it.
+    monkeypatch.setitem(sys.modules, "av", None)
+    clip = {"array": np.zeros(1600, np.float32), "sampling_rate": 16000}
+    assert decision._decode_audio([]) == [] and decision._clips(()) == []
+    assert [samples.shape for samples in decision._clips([clip])] == [(1600,)]
+    with pytest.raises(DecisionUnsupportedError, match = "PyAV"):
+        decision._clips(["data:audio/wav;base64,AAAA"])
+
+
+def test_an_adapter_on_two_towers_of_the_same_layer_numbers_is_refused(tmp_path):
+    mx = pytest.importorskip("mlx.core")
+    pytest.importorskip("mlx_lm")
+
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"peft_type": "LORA", "r": 2, "lora_alpha": 2}))
+    pair = {"lora_A.weight": mx.zeros((2, 4)), "lora_B.weight": mx.zeros((4, 2))}
+    decoder, audio = "base_model.model.thinker.model.layers.0.self_attn.q_proj", "base_model.model.thinker.audio_tower.layers.0.self_attn.q_proj"
+    # Together they collapse into one key; alone the tower's would land on the decoder's layer of its number.
+    for stems in ((decoder, audio), (audio,), ("base_model.model.thinker.talker.model.layers.1.mlp.up_proj",), ("base_model.model.multi_modal_projector.linear_1",)):
+        mx.save_safetensors(str(tmp_path / "adapter_model.safetensors"), {f"{stem}.{name}": value for stem in stems for name, value in pair.items()})
+        with pytest.raises(ValueError, match = "tower besides the decoder"):
+            decision._attach_lora(None, tmp_path)
+    assert not any(map(decision._off_decoder, (decoder, "base_model.model.model.language_model.layers.3.mlp.down_proj", "base_model.model.model.layers.2.self_attn.o_proj")))
