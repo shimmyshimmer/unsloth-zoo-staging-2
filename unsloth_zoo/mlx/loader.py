@@ -1060,7 +1060,8 @@ def _raise_mlx_remote_code_refusal(model_path, error, *, tokenizer_only=False):
             ) from error
 
 
-# mlx-lm < 0.32 and mlx-vlm exec a config.json `model_file` unchecked; trust is scoped here.
+# mlx-lm < 0.32 and mlx-vlm exec a config.json `model_file` unchecked; trust is scoped here and
+# handed to the releases that take their own `trust_remote_code`.
 _MLX_MODEL_FILE_TRUST = contextvars.ContextVar("unsloth_mlx_model_file_trust", default=False)
 
 
@@ -1103,9 +1104,9 @@ def _guard_mlx_model_file_loader(module, name, declared_model_file, required_par
         signature = inspect.signature(original)
     except (TypeError, ValueError):
         return
-    # Newer releases gate model_file on their own trust_remote_code; older ones never exec it.
-    if "trust_remote_code" in signature.parameters or required_parameter not in signature.parameters:
+    if required_parameter not in signature.parameters:
         return
+    forwards_trust = "trust_remote_code" in signature.parameters
 
     @wraps(original)
     def guarded(*args, **kwargs):
@@ -1120,12 +1121,14 @@ def _guard_mlx_model_file_loader(module, name, declared_model_file, required_par
                 f"Unsloth: The model at {model_path} names a model_file ({model_file!r}) outside "
                 "its own folder. Refusing to run it."
             )
-        if model_file and not _MLX_MODEL_FILE_TRUST.get():
+        if model_file and not (_MLX_MODEL_FILE_TRUST.get() or forwards_trust and arguments.get("trust_remote_code")):
             raise ValueError(
                 f"Unsloth: The model at {model_path} requires importing and running a custom "
                 f"module ({model_file!r}) to build its architecture. This is disabled by "
                 "default. Pass trust_remote_code=True if you trust this model."
             )
+        if forwards_trust and "trust_remote_code" not in arguments:
+            kwargs["trust_remote_code"] = _MLX_MODEL_FILE_TRUST.get()
         return original(*args, **kwargs)
 
     guarded._unsloth_model_file_guard = True
@@ -6965,6 +6968,52 @@ def _ensure_vlm_prompt_utils_patched():
     _vlm_prompt_utils_patched = True
 
 
+_exact_verify_sums_promoted = False
+_LOW_PRECISION_SUM = re.compile(r"sum \+= x\[i\][^;]*;")
+_SUMMED_ELEMENT = re.compile(r"\bx\[i(?: \+ \d+)?\]")
+# Header strings and header builders of mlx-vlm's exact verify kernels, which copy MLX's qmv input sum.
+_EXACT_VERIFY_SUM_SOURCES = {
+    "mlx_vlm.models.quantized_verifier": ("_AFFINE_MOE_HC_HEADER", "_target_verify_qlinear_header"),
+    "mlx_vlm.models.fast_ops": ("_AFFINE5_SWITCH_HEADER", "_AFFINE4_SWITCH_HEADER"),
+    "mlx_vlm.models.glm_moe_dsa.speculative_verifier": ("_quantized_head_header",),
+}
+
+
+def _promote_partial_sums(source):
+    return _LOW_PRECISION_SUM.sub(
+        lambda statement: _SUMMED_ELEMENT.sub(lambda x: f"float({x.group(0)})", statement.group(0)), source)
+
+
+def _ensure_exact_verify_sums_promoted():
+    """mlx-vlm <= 0.7.8's exact verify kernels add their input in its own dtype, as MLX's qmv did
+    before 0.32.4; 0.32.4 promotes each element to float32 first, so verify stopped matching decode
+    bit for bit. Rewrite the sums that still have the old form. Gated on MLX and on the source."""
+    global _exact_verify_sums_promoted
+
+    if _exact_verify_sums_promoted:
+        return
+    import mlx.core as mx
+    from packaging.version import Version
+
+    if Version(mx.__version__) >= Version("0.32.4"):
+        for module_name, names in _EXACT_VERIFY_SUM_SOURCES.items():
+            try:
+                module = importlib.import_module(module_name)
+            except ImportError:
+                continue
+            for name in names:
+                source = getattr(module, name, None)
+                if isinstance(source, str):
+                    setattr(module, name, _promote_partial_sums(source))
+                elif isinstance(source, types.FunctionType) and _LOW_PRECISION_SUM.search(_safe_getsource(source) or ""):
+                    setattr(module, name, wraps(source)(lambda *a, _build = source, **k: _promote_partial_sums(_build(*a, **k))))
+            # A verify run before this load built kernels from the old sources.
+            for value in list(vars(module).values()):
+                if getattr(value, "__module__", None) == module_name and callable(getattr(value, "cache_clear", None)):
+                    value.cache_clear()
+    _exact_verify_sums_promoted = True
+
+
 def _ensure_vlm_processor_inputs_patched():
     """Patch mlx-vlm's processor call without replacing its input preparation."""
 
@@ -7502,7 +7551,8 @@ def _mlx_generate(self, *args, **kwargs):
                 dense_prefill_linear(self), \
                 fused_packed_gated_delta(self), \
                 fused_residual_norm_handoff(self):
-            for response in stream_generate(
+            # mlx-lm 0.32 refuses max_tokens=0; the reply is then just the prompt.
+            for response in () if max_tokens == 0 else stream_generate(
                 self,
                 tokenizer,
                 prompt_ids,
@@ -9547,6 +9597,7 @@ class FastMLXModel:
                 install_mlx_compile_patches()
             _ensure_vlm_processor_inputs_patched()
             _ensure_vlm_prompt_utils_patched()
+            _ensure_exact_verify_sums_promoted()
             _ensure_xing4_0_sliced_hyper_connection_base(model_type)
             _ensure_minicpmo_mlx_sanitize(model_type)
             _ensure_minicpmo_vision_dtype(model_type)
