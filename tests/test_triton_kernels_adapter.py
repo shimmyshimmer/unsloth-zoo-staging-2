@@ -254,12 +254,7 @@ def fresh(monkeypatch):
     monkeypatch.delenv("UNSLOTH_TRITON_KERNELS_SOURCE", raising = False)
     monkeypatch.delenv("UNSLOTH_MXFP4_MATMUL_OGS", raising = False)
     monkeypatch.setattr(tkc, "_import_vllm_vendored", lambda: None)
-    before = set(sys.modules)
-    yield monkeypatch
-    # monkeypatch restores modules it replaced, not ones a test imported fresh: a fake `vllm`
-    # left behind makes a later importorskip("vllm") on this worker return it instead of skipping.
-    for key in [k for k in sys.modules if k not in before and k.split(".", 1)[0] in ("vllm", "triton_kernels")]:
-        del sys.modules[key]
+    return monkeypatch
 
 
 ALL_APIS = (tkc.API_OGS_ROUTING, tkc.API_OGS_RAGGED, tkc.API_MATMUL_RAGGED)
