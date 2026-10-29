@@ -38,6 +38,7 @@ import os
 import stat
 import torch
 import subprocess
+import gc
 import types
 import time
 import logging
@@ -5204,14 +5205,28 @@ def patch_lora_forwards(torch_compile_options):
     Linear_LoRA_Layers = get_lora_layer_modules()
     success = 0
     could_not_replace_modules = []
+    force_float32 = os.environ.get("UNSLOTH_FORCE_FLOAT32", "0")
     for function, parent, child in Linear_LoRA_Layers:
         if not hasattr(function, "forward"):
             continue
-        if function.forward.__name__ == "unsloth_forward":
-            continue
+        original_forward = function.forward
+        previous_forward = None
+        if original_forward.__name__ == "unsloth_forward":
+            # Built under another flag (an fp16 load before a bf16 one): rebuild from PEFT's forward.
+            if getattr(original_forward, "_unsloth_force_float32", force_float32) == force_float32:
+                continue
+            previous_forward = original_forward
+            original_forward = getattr(original_forward, "_unsloth_original_forward", None)
+            if original_forward is None:
+                continue
+            variant = getattr(previous_forward, "_unsloth_variants", {}).get(force_float32)
+            if variant is not None:
+                _install_lora_forward_variant(function, previous_forward, variant)
+                success += 1
+                continue
 
         exec(f"import {parent}", locals(), globals())
-        source = inspect.getsource(function.forward)
+        source = inspect.getsource(original_forward)
 
         spaces = source.find("def")
         source = source.split("\n")
@@ -5302,8 +5317,14 @@ def patch_lora_forwards(torch_compile_options):
                 prepend=f"\n{variant_kwarg_import}torch_compile_options = {torch_compile_options}\n"
                 + extra_prepend,
             ).unsloth_forward
+            forward._unsloth_force_float32 = force_float32
+            forward._unsloth_original_forward = original_forward
+            forward._unsloth_torch_compile_options = torch_compile_options
             if integer_input_inline:
                 forward._unsloth_integer_input = True
+            if previous_forward is not None:
+                _install_lora_forward_variant(function, previous_forward, forward)
+                continue
             exec(f"{parent}.{child}.forward = forward", globals(), locals())
         else:
             could_not_replace_modules.append(parent)
@@ -6199,6 +6220,97 @@ def _patch_torch_dtype_modules(
     pass
 
 
+def _install_lora_forward_variant(function, previous_forward, forward):
+    """Switch PEFT's LoRA class to `forward` without changing the arithmetic of live layers.
+
+    Layers created under the previous flag keep their variant (a model loaded earlier must give
+    the same results after a later load); layers created later take the new one.
+    """
+    variants = dict(getattr(previous_forward, "_unsloth_variants", None) or {
+        previous_forward._unsloth_force_float32: previous_forward,
+    })
+    flag = forward._unsloth_force_float32
+    variants[flag] = forward
+    previous_flag = previous_forward._unsloth_force_float32
+    # type(), not isinstance: proxies and deprecated objects answer __class__ with errors / warnings.
+    for module in gc.get_objects():
+        if issubclass(type(module), function) and "_unsloth_force_float32" not in module.__dict__:
+            module._unsloth_force_float32 = previous_flag
+
+    def unsloth_forward(self, x, *args, **kwargs):
+        variant = variants.get(getattr(self, "_unsloth_force_float32", None), forward)
+        return variant(self, x, *args, **kwargs)
+
+    for key in ("_unsloth_force_float32", "_unsloth_original_forward",
+                "_unsloth_torch_compile_options", "_unsloth_integer_input"):
+        if hasattr(forward, key):
+            setattr(unsloth_forward, key, getattr(forward, key))
+    unsloth_forward._unsloth_variants = variants
+    function.forward = unsloth_forward
+
+
+def _reconcile_lora_forwards():
+    """PEFT's LoRA forwards are global: another model family's load may have rebuilt them under the
+    other UNSLOTH_FORCE_FLOAT32, so an unchanged modeling file still rebuilds stale ones."""
+    force_float32 = os.environ.get("UNSLOTH_FORCE_FLOAT32", "0")
+    try:
+        layers = get_lora_layer_modules()
+    except Exception:
+        return
+    for function, parent, child in layers:
+        forward = getattr(function, "forward", None)
+        stamped = getattr(forward, "_unsloth_force_float32", None)
+        if stamped is not None and stamped != force_float32:
+            options = getattr(forward, "_unsloth_torch_compile_options", None)
+            if options is not None:
+                patch_lora_forwards(options)
+            return
+
+
+# model_location -> {(dict name or None, key): original}, recorded before the first replacement.
+_MODELING_FILE_ORIGINALS = {}
+# model_location -> _compiled_source_key() of its last pass. Not a module attribute:
+# dir(modeling_file) feeds an unstable argsort, so one more name reorders the imports.
+_MODELING_FILE_KEYS = {}
+
+
+def _compiled_source_key():
+    """Env decisions baked into the generated module source at compile time."""
+    return (
+        os.environ.get("UNSLOTH_FORCE_FLOAT32", "0"),
+        os.environ.get("UNSLOTH_FORCE_CUSTOM_DTYPE", ""),
+    )
+
+
+def _unpatch_modeling_file(modeling_file):
+    """Undo a compile pass made under another source key, so the next one regenerates.
+
+    The compiled classes replaced the originals in modeling_file, and every source the
+    compiler reads comes from there, so put the originals back and rerun the
+    pre_compile temporary patches against them (they ran on the compiled classes).
+    """
+    originals = _MODELING_FILE_ORIGINALS.get(modeling_file.__name__, {})
+    for (container, key), value in originals.items():
+        try:
+            if container is None:
+                setattr(modeling_file, key, value)
+            else:
+                getattr(modeling_file, container)[key] = value
+        except Exception:
+            pass
+    vars(modeling_file).pop("__UNSLOTH_PATCHED__", None)
+    from unsloth_zoo.temporary_patches import TEMPORARY_PATCHES
+
+    for temporary_patch in TEMPORARY_PATCHES:
+        try:
+            if "phase" in inspect.signature(temporary_patch).parameters:
+                temporary_patch(phase="pre_compile")
+            else:
+                temporary_patch()
+        except Exception:
+            pass
+
+
 @_compile_versions_scope
 def unsloth_compile_transformers(
     model_type: str = "llama",
@@ -6269,6 +6381,13 @@ def unsloth_compile_transformers(
         return
     # Later `eval(model_location)` calls need `transformers` bound in globals
     exec("import transformers", globals())
+    # A pass compiled under another key (an fp16 load before a bf16 one) is redone.
+    if hasattr(modeling_file, "__UNSLOTH_PATCHED__") and _MODELING_FILE_KEYS.get(
+        model_location, _compiled_source_key()
+    ) != _compiled_source_key():
+        _unpatch_modeling_file(modeling_file)
+    if not hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
+        _MODELING_FILE_ORIGINALS.pop(model_location, None)
     disable_compile_functions = set(DISABLE_COMPILE_FUNCTIONS)
     disable_compile_functions.update(DISABLE_COMPILE_MODEL_FUNCTIONS.get(model_type, ()))
     function_source_rewrites = model_function_source_rewrites(modeling_file, model_type)
@@ -6277,6 +6396,8 @@ def unsloth_compile_transformers(
     module_eager_rewrites = module_forward_eager_rewrites(modeling_file, model_type)
 
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
+        if (not full_disable) and fast_lora_forwards:
+            _reconcile_lora_forwards()
         # Get __UNSLOTH_SUPPORTS_SDPA__
         if hasattr(modeling_file, "__UNSLOTH_SUPPORTS_SDPA__"):
             if supports_sdpa is not None:
@@ -6413,6 +6534,7 @@ def unsloth_compile_transformers(
     pass
 
     modeling_file.__UNSLOTH_PATCHED__ = True
+    _MODELING_FILE_KEYS[model_location] = _compiled_source_key()
     functions = dir(modeling_file)
     try:
         full_source = inspect.getsource(modeling_file)
@@ -7669,9 +7791,12 @@ def unsloth_compile_transformers(
         )
         return
 
-    # Import and replace with new module
+    # Import and replace with new module. Keep the first originals for _unpatch_modeling_file.
+    originals = _MODELING_FILE_ORIGINALS.setdefault(model_location, {})
     replacement_classes = {}
     for module in all_standalone_classes.keys():
+        if hasattr(modeling_file, module):
+            originals.setdefault((None, module), getattr(modeling_file, module))
         try:
             # The compiled replacement class must keep the counting convention the rewrite marked.
             original = getattr(modeling_file, module, None)
@@ -7706,6 +7831,7 @@ def unsloth_compile_transformers(
             found = False
             for replaced_class in replaced_classes:
                 if replaced_class == value:
+                    originals.setdefault((check, key), item[key])
                     try:
                         exec(
                             f"{model_location}.{check}['{key}'] = combined_module.{replaced_class}",
