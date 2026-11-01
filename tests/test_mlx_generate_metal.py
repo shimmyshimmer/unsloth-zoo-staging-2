@@ -1238,6 +1238,7 @@ def test_nax_quantized_linear_scope_routes_restores_and_falls_back(monkeypatch, 
     from unsloth_zoo.mlx import inference, nax
     from unsloth_zoo.mlx.generate import generation_mode
 
+    monkeypatch.setenv("UNSLOTH_MLX_DENSE_PREFILL", "1")
     model = _QuantizedHead()
     calls = []
     kernel = nax.small_m_qmm
@@ -1259,10 +1260,14 @@ def test_nax_quantized_linear_scope_routes_restores_and_falls_back(monkeypatch, 
         patch.setattr(nn.QuantizedLinear, "__call__", functools.wraps(linear_call)(lambda *a: linear_call(*a)))
         with inference.nax_quantized_linear(model):
             assert type(model.proj) is nn.QuantizedLinear
-    with generation_mode(model):
+    with generation_mode(model, call = ("batch", "speculative")):
         with inference.nax_quantized_linear(model):
-            assert [type(m).__name__ for m in (model.embed, model.proj, model.odd)] == [
-                "_NaxSmallMQuantizedEmbedding", "_NaxSmallMQuantizedLinear", "QuantizedLinear"]
+            classes = inference._nax_qmm_classes(inference._NAX_QMM_ROUTE, nn.QuantizedLinear.__call__, nn.QuantizedEmbedding.as_linear)
+            assert [type(m)._unsloth_singleton_native for m in (model.embed, model.proj)] == [
+                classes[nn.QuantizedEmbedding], classes[nn.QuantizedLinear]]
+            assert all(m._unsloth_nax_qmm_scopes > 0 for m in (model.embed, model.proj))
+            assert type(model.odd)._unsloth_singleton_native is inference._dense_qmm_class(nn.QuantizedLinear.__call__)
+            assert model.odd._unsloth_dense_qmm_scopes == 1 and not getattr(model.odd, "_unsloth_nax_qmm_scopes", 0)
         assert type(model.proj) is not nn.QuantizedLinear   # the outer scope still owns it
         for rows, native in natives.items():
             routed = run(rows)
@@ -1278,7 +1283,9 @@ def test_nax_quantized_linear_scope_routes_restores_and_falls_back(monkeypatch, 
         monkeypatch.setattr(nn.QuantizedLinear, "__call__", lambda self, x: linear_call(self, x) * 0)
         assert not any(mx.any(out).item() for out in run(4)) and not calls   # drifted: native, new body
         monkeypatch.undo()
-    assert (type(model.embed), type(model.proj)) == (nn.QuantizedEmbedding, nn.QuantizedLinear)
+    assert (type(model.embed), type(model.proj), type(model.odd)) == (nn.QuantizedEmbedding, nn.QuantizedLinear, nn.QuantizedLinear)
+    assert not any(name in vars(module) for module in (model.embed, model.proj, model.odd)
+                   for name in ("_unsloth_nax_qmm_scopes", "_unsloth_dense_qmm_scopes", "_unsloth_singleton_scopes"))
     assert "_unsloth_nax_qmm_rows" not in model.proj
 
 
@@ -1345,6 +1352,17 @@ def _apple_gpu():
 
 # simdgroup matrices are only known to lay out their elements this way on Apple's own GPUs.
 apple_gpu_only = pytest.mark.skipif(not _apple_gpu(), reason="requires a non-paravirtual Apple GPU")
+
+
+@apple_gpu_only
+def test_singleton_decode_serves_only_a_call_naming_the_speculative_trait():
+    from unsloth_zoo.mlx import inference
+    model = nn.Module()
+    model.proj = nn.QuantizedLinear(512, 512, bias = False, group_size = 64, bits = 4)
+    model.eval()
+    for call, served in ((None, False), ((), False), (("batch", "vision"), False), (("batch", "speculative"), True)):
+        with inference.inference_scopes(model, call):
+            assert ("_unsloth_singleton_scopes" in vars(model.proj)) == served, call
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
@@ -1513,6 +1531,135 @@ def _same_bits(outputs, natives):
     return all(mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item() for a, b in zip(outputs, natives))
 
 
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("bits,group_size", [(4, 64), (8, 32), (6, 128), (3, 64), (5, 32), (2, 128)])
+@apple_gpu_only
+def test_lane_qmm_rows_do_not_depend_on_the_call_and_stay_within_fp32_reordering(monkeypatch, bits, group_size, dtype):
+    from unsloth_zoo.mlx import matmul, nax
+
+    built, metal_kernel = [], mx.fast.metal_kernel
+    monkeypatch.setattr(mx.fast, "metal_kernel", lambda **kwargs: built.append(kwargs["name"]) or metal_kernel(**kwargs))
+    monkeypatch.setattr(matmul, "_LANE_WIDE_COLUMNS", 192)
+    matmul._lane_launch.cache_clear()
+    K = 64 * group_size   # split across eight simdgroups
+    for N in (136, 160, 192):   # one, two and four column tiles, or (4- and 8-bit on M5) the tensor units
+        w, scales, biases = _quantized(N, K, group_size, dtype, bits, seed = bits)
+        x = (mx.random.normal((32, K), key = mx.random.key(group_size)) * (1 + mx.arange(32)[:, None])).astype(dtype)
+        full = matmul.lane_qmm(x, w, scales, biases, group_size, bits)
+        if not matmul._lane_tensor_units(N, bits):
+            # "slices" keeps the one-group loop, the same bits; 5 groups a simdgroup leave the unrolled loop a remainder.
+            for M, groups in ((32, None), (8, None), (8, 40)):
+                matmul._lane_launch.cache_clear()
+                seen = len(built)
+                two = matmul.lane_qmm(x[:M], w, scales, biases, group_size, bits, groups = groups)
+                assert built[seen:] and all("_twogroups_" in name for name in built[seen:]), built[seen:]
+                seen = len(built)
+                one = matmul.lane_qmm(x[:M], w, scales, biases, group_size, bits, groups = groups, reader = "slices")
+                assert built[seen:] and not any("_twogroups_" in name for name in built[seen:]), built[seen:]
+                assert mx.array_equal(mx.view(one, mx.uint16), mx.view(two, mx.uint16)).item(), (N, M, groups)
+        for start, M in ((0, 1), (3, 1), (5, 6), (9, 16), (0, 17), (15, 17), (31, 1)):
+            part = matmul.lane_qmm(x[start:start + M], w, scales, biases, group_size, bits)
+            assert mx.array_equal(mx.view(part, mx.uint16), mx.view(full[start:start + M], mx.uint16)).item(), (N, start, M)
+        with mx.stream(mx.cpu):
+            weight = mx.dequantize(w, scales.astype(mx.float32), biases.astype(mx.float32), group_size = group_size,
+                                   bits = bits)
+            exact = x.astype(mx.float32) @ weight.T
+            bound = mx.finfo(dtype).eps * mx.abs(exact) + K * 2.0 ** -23 * (mx.abs(x.astype(mx.float32)) @ mx.abs(weight).T)
+            mx.eval(exact, bound)
+        assert mx.all(mx.abs(full.astype(mx.float32) - exact) <= bound).item(), N
+    matmul._lane_launch.cache_clear()
+    # On M5, 4- and 8-bit weights 160 wide run on the tensor units; everything else on simdgroup matrices, whose
+    # 2- and 4-bit weights pair their codes and, 192 wide, take four column tiles.
+    tensor = nax.nax_available() and bits in (4, 8)
+    assert any("tensor" in name for name in built) == tensor
+    assert any("paired" in name for name in built) == (bits in (2, 4))   # 136 wide is never on the tensor units
+    column_tiles = 192 // 8 // matmul._lane_launch(1, 192, K, group_size, bits, dtype).keywords["grid"][1]
+    assert tensor or column_tiles == (4 if bits in (2, 4) else 2)
+    assert matmul._lane_launch(1, 160, K, group_size, bits, dtype).keywords["threadgroup"][0] == 32 * 8
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("bits", [4, 8])
+@nax_only
+def test_tensor_lane_readers_keep_each_rows_bits_within_fp32_reordering(monkeypatch, bits, dtype):
+    from unsloth_zoo.mlx import matmul
+
+    built, metal_kernel = [], mx.fast.metal_kernel
+
+    def nan_filled(**kwargs):   # every launch starts from NaN, so an output a reader leaves unwritten cannot pass
+        built.append(kwargs["name"])
+        kernel = metal_kernel(**kwargs)
+        return lambda **call: kernel(**call, init_value = float("nan"))
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", nan_filled)
+    matmul._lane_launch.cache_clear()
+    matmul._lane_sums_launch.cache_clear()
+    wide = "bias" if bits == 4 and dtype == mx.bfloat16 else "slices" if bits == 8 else "staged"
+    # 20 groups: a whole 16 of them and four past it; 19 groups cannot be staged four at a time. 24 groups: slices
+    # starting inside a run of eight; 256: deep enough for the partials to reuse the scale stages.
+    narrow, runs = "slices" if bits == 4 else "staged", "scales" if bits == 4 else "staged"
+    for (N, K), reader in (((matmul._LANE_TENSOR_WIDE, 1280), wide), ((96, 1280), narrow), ((96, 1216), "slices"),
+                           ((96, 1536), runs), ((32, 16384), runs)):
+        built.clear()
+        w, scales, biases = _quantized(N, K, 64, dtype, bits, seed = N + K)
+        x = (mx.random.normal((32, K), key = mx.random.key(K)) * (1 + mx.arange(32)[:, None] % 5)).astype(dtype)
+        full = matmul.lane_qmm(x, w, scales, biases, 64, bits)
+        widened = matmul.lane_qmm(x, w, scales, biases, 64, bits, output_dtype = mx.float32)
+        assert _same_bits([widened.astype(dtype)], [full]) and mx.any(widened != full.astype(mx.float32)).item()
+        for start, M in ((5, 1), (2, 3), (7, 8), (11, 9), (16, 16), (1, 17), (0, 32)):
+            part = matmul.lane_qmm(x[start:start + M], w, scales, biases, 64, bits)
+            assert _same_bits([part], [full[start:start + M]]), (N, K, start, M)
+        assert {name.split("_")[4] for name in built if "tensor" in name} == {reader}, (N, K, built)
+        if reader == "scales":   # also over K's first half, as the shortlist reads it
+            for groups in (None, K // 128):
+                got, want = (matmul.lane_qmm(x, w, scales, biases, 64, bits, groups = groups, reader = r) for r in ("scales", "slices"))
+                assert _same_bits([got], [want]), groups
+        with mx.stream(mx.cpu):
+            weight = mx.dequantize(w, scales.astype(mx.float32), biases.astype(mx.float32), group_size = 64, bits = bits)
+            exact = x.astype(mx.float32) @ weight.T
+            bound = mx.finfo(dtype).eps * mx.abs(exact) + K * 2.0 ** -23 * (mx.abs(x.astype(mx.float32)) @ mx.abs(weight).T)
+            mx.eval(exact, bound)
+        assert mx.all(mx.abs(full.astype(mx.float32) - exact) <= bound).item(), (N, K)
+        if N == matmul._LANE_TENSOR_WIDE:   # the shortlist's reader, which only selects candidates
+            for rows in (1, 2):
+                few = matmul.lane_qmm(x[:rows], w, scales, biases, 64, bits, reader = "interleaved")
+                assert mx.all(mx.abs(few.astype(mx.float32) - exact[:rows]) <= bound[:rows]).item(), rows
+    matmul._lane_launch.cache_clear()
+    matmul._lane_sums_launch.cache_clear()
+
+
+def test_lane_qmm_covers_affine_2_to_8_bit_weights_on_apple_gpus(monkeypatch):
+    from unsloth_zoo.mlx import matmul, nax
+
+    for args in ((136, 2048, 64, 4, "affine"), (8, 64, 32, 3, "affine"), (8192, 5120, 128, 6, "affine")):
+        assert matmul.lane_qmm_supported(*args)
+    for args in ((132, 2048, 64, 4, "affine"), (136, 2000, 64, 4, "affine"), (136, 2048, 16, 4, "affine"),
+                 (0, 2048, 64, 4, "affine"), (136, 0, 64, 4, "affine"),
+                 (136, 2048, 64, 7, "affine"), (136, 2048, 32, 4, "mxfp4")):
+        assert not matmul.lane_qmm_supported(*args)
+    monkeypatch.setattr(nax.mx.metal, "is_available", lambda: True)
+    for architecture, expected in (("applegpu_g13s", True), ("applegpu_g17s", True), ("air64_v27", False)):
+        monkeypatch.setattr(nax, "_gpu_architecture", lambda: architecture)
+        assert matmul.lane_qmm_available() is expected, architecture
+
+
+@apple_gpu_only
+def test_lane_qmms_keeps_each_weights_bits_on_every_reader():
+    from unsloth_zoo.mlx import matmul
+
+    if not matmul._lane_tensor_units(32, 4):
+        pytest.skip("the shared launch needs tensor units")
+    readers = set()
+    for bits, dtype, K, Ns in ((8, mx.bfloat16, 512, (96, 32)), (4, mx.float16, 576, (64, 32)), (4, mx.bfloat16, 256, (16384, 16384))):
+        ws = [mx.quantize(mx.random.normal((N, K), key = mx.random.key(N + i)).astype(dtype) * 0.05, group_size = 64, bits = bits)
+              for i, N in enumerate(Ns)]
+        readers.add(matmul.lane_qmms_reader(Ns[0], K, 64, bits, dtype))
+        for rows in (5, 20):
+            x = mx.random.normal((rows, K), key = mx.random.key(rows)).astype(dtype)
+            assert _same_bits(matmul.lane_qmms(x, ws, 64, bits), [matmul.lane_qmm(x, *w, 64, bits) for w in ws]), (bits, K, rows)
+    assert readers == {"staged", "slices", "bias"}
+
+
 @real_mlx_only
 @metal_only
 def test_dense_prefill_linear_matches_native_and_restores(monkeypatch):
@@ -1586,8 +1733,8 @@ def test_dense_prefill_linear_composes_with_the_nax_scope(monkeypatch):
         assert type(model.wide).__name__ == "_NaxSmallMQuantizedLinear"
         mx.eval(model(x))
         assert not dequantized   # outside the dense scope the NAX-routed linear falls back to the native call
-        with generation_mode(model):
-            assert type(model.wide).__name__ == "_NaxSmallMQuantizedLinear"
+        with generation_mode(model, call = ("batch", "speculative")):
+            assert type(model.wide)._unsloth_singleton_native.__name__ == "_NaxSmallMQuantizedLinear"
             mx.eval(model(x))
             dequantized.clear()
             assert _same_bits(model(x), native) and len(dequantized) == 1
@@ -1648,9 +1795,9 @@ def test_tiled_prefill_takes_what_stock_runs_as_plain_qmm_bit_for_bit(monkeypatc
     seen, quantized_matmul = [], mx.quantized_matmul
     monkeypatch.setattr(mx, "quantized_matmul", lambda a, w, *args, **kwargs: (
         seen.append(a.shape[-2]) if w.shape[0] == 2048 else None, quantized_matmul(a, w, *args, **kwargs))[1])
-    with generation_mode(model):
+    with generation_mode(model, call = ("batch", "speculative")):
         if matmul.simd_qmm_available():   # the small-row class must leave the tile's rows to the dense scope
-            assert type(model.wide).__name__ == "_SimdSmallMQuantizedLinear"
+            assert type(model.wide)._unsloth_singleton_native.__name__ == "_SimdSmallMQuantizedLinear"
             assert model.wide._unsloth_nax_qmm_next == 33 * 512   # a 64-row tile pads no more from 33 rows
         for x, native in zip(xs, natives):
             assert _same_bits(model(x), native)
