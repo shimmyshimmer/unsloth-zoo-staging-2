@@ -942,6 +942,8 @@ def _sequential_history(processor):
         return processor(tokens[state["offset"] :], logits)
 
     _shown.history_only = getattr(processor, "history_only", False)
+    if hasattr(processor, "settle"):
+        _shown.settle = lambda tokens: processor.settle(tokens[state["offset"] :])
     return _shown
 
 
@@ -2574,7 +2576,8 @@ def _row_view(entry, index: int):
     if name == "CacheList":
         caches = [_row_view(cache, index) for cache in entry.caches]
         return None if any(cache is None for cache in caches) else module.CacheList(*caches)
-    if getattr(entry, "keys", None) is None or entry.keys.shape[0] != 1:
+    keys = getattr(entry, "keys", None)
+    if keys is None or isinstance(keys, (tuple, list)) or keys.shape[0] != 1:
         return None
     if name == "KVCache":
         view, start, end = module.KVCache(), 0, entry.offset
@@ -2723,6 +2726,10 @@ def row_quantized_prompt_cache_unavailable_reason() -> str | None:
     if "prefix_cache_merge" not in vars(_quantized_cache_type()):
         return f"{_installed_mlx_vlm_version()} cannot batch a row's own quantized cache"
     return None
+
+
+def speculative_quantized_rows_unavailable_reason() -> str | None:
+    return row_quantized_prompt_cache_unavailable_reason()
 
 
 def row_retire_unavailable_reason() -> str | None:
@@ -4104,6 +4111,7 @@ class _SpeculativeBatchSession:
         install_speculative_seam()
         self.adapter = adapter
         self.speculative = speculative
+        self._layout = None
         self.tokenizer = getattr(adapter.processor, "tokenizer", adapter.processor)
         criteria = getattr(self.tokenizer, "stopping_criteria", None)
         stop_ids = adapter.defaults.stop_token_ids
@@ -4150,6 +4158,12 @@ class _SpeculativeBatchSession:
         finished = admitted.pending in self.stop_tokens or admitted.max_tokens == 1
         retire = getattr(request.prompt_cache_state, "retire", None)
         if not finished:
+            layout = _cache_layout(admitted.cache)
+            if self.engine.rows and layout != self._layout:
+                if callable(retire):
+                    retire(lambda: list(admitted.cache))
+                raise BatchRowRefused("This request's prompt cache does not match the layout of the batch's other rows.")
+            self._layout = layout
             try:
                 self.engine.add(admitted)
             except BaseException:
@@ -4172,8 +4186,10 @@ class _SpeculativeBatchSession:
             return 0
         cache, lengths = state.open(list(prompt))
         cache = list(cache)
-        if any(isinstance(entry, _quantized_cache_types()) for entry in cache):
-            raise BatchRowRefused("This request's prompt cache is quantized; speculative batches run on full-precision KV caches.")
+        if any(isinstance(entry, _quantized_cache_types()) and not isinstance(entry, _quantized_cache_type()) for entry in cache):
+            raise BatchRowRefused("This request's prompt cache is TurboQuant; speculative batches run on full-precision or affine-quantized KV caches.")
+        if "prefix_cache_merge" not in vars(_quantized_cache_type()) and any(isinstance(entry, _quantized_cache_type()) for entry in cache):
+            raise BatchRowRefused(f"{_installed_mlx_vlm_version()} cannot batch a row's own quantized cache.")
         prefix = _cache_offset(cache)
         if prefix is None:
             raise BatchRowRefused("This request's prompt cache holds no offset to resume from.")
