@@ -964,7 +964,9 @@ def _patch_layer_class_for_gc(layer_cls):
     fn = layer_cls.__call__
 
     def checkpointed_fn(self, *args, **kwargs):
-        slot = next((a for a in args if isinstance(a, _SharedKVSlot)), None)
+        slot = next((a for a in args if isinstance(a, (_SharedKVSlot, _PrefixKVSlot, _PrefixStateSlot))), None)
+        if slot is None and isinstance(kwargs.get("cache"), (_PrefixKVSlot, _PrefixStateSlot)):
+            slot = kwargs["cache"]
         if slot is None:
             if "shared_kv" in kwargs:
                 args, kwargs["shared_kv"] = _tie_to_hidden_state(
@@ -1005,12 +1007,17 @@ def _patch_layer_class_for_gc(layer_cls):
             args = tuple(_detach_integer_arrays(a) for a in args)
             kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
             out = fn(self, *args, **kwargs)
-            return out, slot.recorded()
+            # mx.vjp seeds a repeated output with its first cotangent only: K/V also in out (Gemma 4's) cross once.
+            leaves = {id(leaf): index for index, (_, leaf) in enumerate(mlx.utils.tree_flatten(out))}
+            repeated[:] = [leaves.get(id(state)) for state in slot.recorded()]
+            return out, tuple(None if index is not None else state for state, index in zip(slot.recorded(), repeated))
 
+        repeated = []
         args, borrowed = _tie_to_hidden_state(args, slot.borrow())
         out, recorded = mx.checkpoint(inner_fn)(
             self.trainable_parameters(), borrowed, *args, **kwargs)
-        slot.install(recorded)
+        leaves = [leaf for _, leaf in mlx.utils.tree_flatten(out)]
+        slot.install(tuple(state if index is None else leaves[index] for state, index in zip(recorded, repeated)))
         return out
 
     layer_cls.__call__ = checkpointed_fn
@@ -1197,6 +1204,102 @@ class _SharedKVSlot:
 
     def recorded(self):
         return self.keys, self.values
+
+
+# RoPE class names whose mlx-lm/mlx-vlm implementations rotate by position alone. Others pick their frequencies from the
+# forward's length or the batch's largest offset (dynamic NTK, longrope's short/long switch). A name cannot vouch for an
+# arbitrary model's own class, so callers gate on model type first.
+_POSITION_ONLY_ROPES = frozenset((
+    "RoPE", "EagerRoPE", "Llama3RoPE", "YarnRoPE", "ProportionalRoPE", "MRoPERotaryEmbedding", "Qwen3_5RotaryEmbedding",
+))
+
+
+def _length_dependent_ropes(backbone):
+    """RoPE classes in backbone not known to rotate by position alone."""
+    names = {type(module).__name__ for _, module in backbone.named_modules()}
+    return sorted(name for name in names if ("RoPE" in name or "Rotary" in name) and name not in _POSITION_ONLY_ROPES)
+
+
+def _repeat_prefix(prefix, repeats, interleaved=False):
+    return mx.repeat(prefix, repeats, axis=0) if interleaved else mx.concatenate([prefix] * repeats)
+
+
+class _PrefixKVSlot:
+    """A layer's cache for a shared-prompt forward. Built without a prefix, it records the prompt's post-RoPE K/V; built
+    from them, it puts the prompt batch, repeated repeats times as a preference batch holds every chosen row before any
+    rejected one (interleaved: each prompt repeats times in turn, as GRPO holds a group's rows), ahead of its rows' own
+    K/V at offset = prompt length, so attention applies RoPE there and a bottom-right causal mask. Re-runnable under
+    mx.checkpoint."""
+
+    __slots__ = ("keys", "values", "offset", "repeats", "recording", "interleaved")
+    borrow, install, recorded = _SharedKVSlot.borrow, _SharedKVSlot.install, _SharedKVSlot.recorded
+
+    def __init__(self, prefix=None, repeats=1, interleaved=False):
+        self.keys, self.values = (None, None) if prefix is None else prefix
+        self.offset = 0 if prefix is None else prefix[0].shape[-2]
+        self.repeats, self.recording, self.interleaved = repeats, prefix is None, interleaved
+
+    def update_and_fetch(self, keys, values):
+        if self.recording:
+            self.keys, self.values = keys, values
+            return keys, values
+        return tuple(
+            mx.concatenate([_repeat_prefix(prefix, self.repeats, self.interleaved), own], axis=-2)
+            for prefix, own in ((self.keys, keys), (self.values, values))
+        )
+
+    def make_mask(self, N, return_array=False, window_size=None):
+        if window_size is None and not return_array:
+            return "causal" if N > 1 else None
+        queries, keys = mx.arange(self.offset, self.offset + N)[:, None], mx.arange(self.offset + N)[None]
+        mask = queries >= keys
+        return mask if window_size is None else mask & (queries < keys + window_size)
+
+
+class _PrefixStateSlot:
+    """_PrefixKVSlot for a linear-attention layer (mlx-vlm's ArraysCache protocol): it records the prompt's final conv
+    window and recurrent state, or starts every row from them. Unslotted, since mlx-vlm tags caches with metadata."""
+
+    lengths = None
+
+    def __init__(self, prefix=None, repeats=1, interleaved=False):
+        self.cache = [None, None] if prefix is None else list(prefix)
+        self.repeats, self.recording, self.interleaved = repeats, prefix is None, interleaved
+
+    def borrow(self):
+        return None if self.cache[0] is None else tuple(self.cache)
+
+    def install(self, borrowed):
+        # A checkpoint recompute must not start the prompt's recording pass from the state it recorded.
+        self.cache = [None, None] if borrowed is None else list(borrowed)
+
+    def recorded(self):
+        return tuple(self.cache)
+
+    def __getitem__(self, index):
+        state = self.cache[index]
+        return state if self.recording or state is None else _repeat_prefix(state, self.repeats, self.interleaved)
+
+    def update_window(self, index, source, width, *, lengths=None):
+        if self.recording:
+            self.cache[index] = source[:, source.shape[1] - width:]
+
+    def update_recurrent(self, index, length, update):
+        output, state = update(self[index], None)[:2]
+        if self.recording:
+            self.cache[index] = state
+        return output, state
+
+
+def _prefix_cache(backbone, recorded=None, repeats=1, interleaved=False):
+    """Recording slots for backbone's layers, or slots extending recorded; None where gemma4 reads another layer's K/V."""
+    if recorded is not None:
+        return [None if slot is None else type(slot)(slot.recorded(), repeats, interleaved) for slot in recorded]
+    sources = getattr(backbone, "previous_kvs", None) or range(len(backbone.layers))
+    return [
+        None if source != index else _PrefixStateSlot() if getattr(layer, "is_linear", False) else _PrefixKVSlot()
+        for index, (layer, source) in enumerate(zip(backbone.layers, sources))
+    ]
 
 
 # Language models that scale token embeddings by sqrt(hidden_size) on the ids path only, so multimodal forwards lose the
@@ -3115,8 +3218,8 @@ def _filter_backbone_kwargs(backbone, kwargs):
     return {k: v for k, v in kwargs.items() if k in allowed}
 
 
-def _vlm_hidden_states(model, batch_dict):
-    """Pre-lm_head hidden states for every position of a collated VLM batch dict."""
+def _vlm_hidden_states(model, batch_dict, cache=None):
+    """Pre-lm_head hidden states for every position of a collated VLM batch dict, through cache if given."""
     input_ids = batch_dict["input_ids"]
     pixel_values = batch_dict.get("pixel_values")
     attention_mask = batch_dict.get("attention_mask")
@@ -3174,7 +3277,7 @@ def _vlm_hidden_states(model, batch_dict):
     ):
         backbone_kwargs["mm_token_type_ids"] = extra_kwargs["mm_token_type_ids"]
 
-    shared_kv = _build_shared_kv_caches(model)
+    shared_kv = _build_shared_kv_caches(model) if cache is None else cache
     if shared_kv is not None:
         backbone_kwargs["cache"] = shared_kv
 
@@ -3184,6 +3287,69 @@ def _vlm_hidden_states(model, batch_dict):
         inputs_embeds=merged_embeds,
         **backbone_kwargs,
     )
+
+
+def _qwen35_image_features(model, pixels, inputs):
+    tower = model.vision_tower
+    return tower(pixels.astype(tower.patch_embed.proj.weight.dtype), inputs["image_grid_thw"])[0]
+
+
+def _gemma4_image_features(model, pixels, inputs):
+    return model.embed_vision(model.vision_tower(pixels, inputs.get("image_position_ids")))
+
+
+# Families whose embedder takes cached_image_features in place of exactly what the encoder computes: the encoder, the
+# per-image inputs it reads beside the pixels, and the modules it runs. Qwen3-VL's cached path drops its deepstack.
+_VLM_IMAGE_ENCODERS = {
+    "qwen3_5": (_qwen35_image_features, ("image_grid_thw",), ("vision_tower",)),
+    "qwen3_5_moe": (_qwen35_image_features, ("image_grid_thw",), ("vision_tower",)),
+    "gemma4": (_gemma4_image_features, ("image_position_ids",), ("vision_tower", "embed_vision")),
+}
+
+
+_VLMImageEncoder = collections.namedtuple("_VLMImageEncoder", ("encode", "keys", "modules", "module_ids"))
+
+
+def _vlm_image_encoder(model):
+    entry = _VLM_IMAGE_ENCODERS.get(_mlx_vlm_canonical_model_type(
+        _config_get(getattr(model, "config", None), "model_type")
+    ))
+    if entry is None:
+        return None
+    modules = tuple(getattr(model, name, None) for name in entry[2])
+    if any(module is None for module in modules):
+        return None
+    children = [child for module in modules for _, child in module.named_modules()]
+    if any(
+        # Each copy and pass would draw its own mask.
+        child.training and type(child).__name__.endswith("Dropout") and _get_mlx_dropout_probability(child) > 0
+        for child in children
+    ):
+        return None
+    return _VLMImageEncoder(entry[0], entry[1], modules, frozenset(map(id, children)))
+
+
+def _vlm_image_features(model, batch_dict, copies=1):
+    """Features of a batch whose images repeat ``copies`` times, from one tower run over the first copy, laid out as
+    the embedder lays them; None when the family or batch has no cached path."""
+    encoder = _vlm_image_encoder(model)
+    pixels = batch_dict.get("pixel_values")
+    if encoder is None or pixels is None or batch_dict.get("pixel_values_videos") is not None:
+        return None
+    encode, keys = encoder.encode, encoder.keys
+    inputs = {k: v for k, v in batch_dict.items() if not k.startswith("_unsloth_") and v is not None}
+    _apply_static_vlm_metadata(model, batch_dict, inputs)
+
+    def first(value):
+        size = value.shape[0] if hasattr(value, "shape") else len(value)
+        return None if size % copies else value[:size // copies]
+
+    parts = {key: first(inputs[key]) for key in keys if key in inputs}
+    pixels = first(pixels)
+    if pixels is None or any(part is None for part in parts.values()):
+        return None
+    features = encode(model, pixels, parts)
+    return mx.concatenate([features] * copies, axis=-2) if copies > 1 else features
 
 
 def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
