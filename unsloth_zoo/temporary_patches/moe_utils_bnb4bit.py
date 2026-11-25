@@ -75,7 +75,6 @@ __all__ = [
 
 
 # ============================================================================
-# Detection
 # ============================================================================
 
 def _is_bnb4bit_param(param) -> bool:
@@ -133,7 +132,6 @@ def _log_unhandled_expert_module_once(module_name: str, module: nn.Module):
 
 
 # ============================================================================
-# Quantization of oversized expert stacks
 # ============================================================================
 
 # bitsandbytes counts elements with a signed 32-bit int inside the 4-bit
@@ -242,7 +240,6 @@ def _make_expert_params4bit(value, **kwargs):
 
 
 # ============================================================================
-# Dequantization
 # ============================================================================
 
 def _dequantize_4bit_in_slices(weight):
@@ -350,15 +347,13 @@ def _dequantize_bnb4bit_expert_weights_once(weight, target_dtype):
 
 
 # ============================================================================
-# Forward dispatcher
 # ============================================================================
 
 _LOGGED_BACKENDS = set()
 
 
 def _log_moe_bnb4bit_backend_once(experts_module, message: str):
-    # Not while tracing: Dynamo guards on the set, so the first traced add makes gradient checkpoint recompute pick a
-    # different graph (CheckpointError on first backward).
+    # Not while tracing: Dynamo guards the set, so the recompute differs (CheckpointError).
     if torch.compiler.is_compiling():
         return
     key = (id(type(experts_module)), message)
@@ -770,8 +765,7 @@ pass
 
 
 # ============================================================================
-# PEFT LoRA support for stacked-MoE bnb 4-bit experts: exposes the logical 3-D shape to ParamWrapper; merge/unmerge runs
-# dequant, add, requant so merge_and_unload() works on packed storage.
+# PEFT LoRA for stacked-MoE bnb 4-bit experts: logical 3-D shape; merge dequant-add-requant.
 # ============================================================================
 
 class _ParamShapeProxy:
@@ -792,8 +786,7 @@ class _ParamShapeProxy:
 
     @property
     def dtype(self):
-        # Report the pre-quant compute dtype as param.dtype so PEFT's tensor.to(param.dtype) casts do not truncate bf16
-        # LoRA deltas to the uint8 packed storage dtype.
+        # param.dtype: pre-quant compute dtype, so PEFT casts never truncate bf16 LoRA deltas.
         quant_state = getattr(self._param, "quant_state", None)
         qs_dtype = getattr(quant_state, "dtype", None) if quant_state is not None else None
         if qs_dtype is not None and (qs_dtype.is_floating_point or qs_dtype.is_complex):

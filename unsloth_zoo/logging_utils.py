@@ -31,7 +31,6 @@ REMOVED_METRICS = [
     "entropy",  # TRL >= 0.22.0
     "aux_loss", # TRL >= 0.23.0
 
-    # GRPO extras
     "clip_ratio",
     'clip_ratio/low_mean',
     'clip_ratio/low_min',
@@ -83,7 +82,6 @@ def NotebookProgressCallback_on_log(Trainer_metrics):
     set_Trainer_metrics = frozenset(Trainer_metrics)
 
     def _NotebookProgressCallback_on_log(self, args, state, control, logs = None, **kwargs):
-        # Only for when there is no evaluation
         if args.eval_strategy == IntervalStrategy.NO and "loss" in logs:
             values = {}
 
@@ -93,8 +91,7 @@ def NotebookProgressCallback_on_log(Trainer_metrics):
                     values[metric.replace("/", " / ")] = logs[metric]
             pass
 
-            # 2) Dynamic per-reward-function metrics (rewards/*): user-defined
-            #    names, so sort for stable column ordering across steps.
+            # 2) Dynamic rewards/* metrics: user-defined names, sorted for stable column order.
             dynamic_reward_keys = sorted(
                 k for k in logs
                 if k.startswith("rewards/") and k not in set_Trainer_metrics
@@ -143,7 +140,6 @@ def NotebookTrainingTracker_write_line(Trainer_metrics):
                 if last_values[0] != values[first_column]:
                     self.inner_table.append([values[c] if c in values else "" for c in columns])
                 else:
-                    # update last line, preserving existing values for missing keys
                     new_values = values
                     for c in columns:
                         if c not in new_values:
@@ -164,7 +160,6 @@ def _PatchRLStatistics(metrics, algorithm):
         if len(metrics) == 0: return
         from transformers.trainer import is_in_notebook
         if is_in_notebook():
-            # Patch DPO notebook printing
             NotebookTrainingTracker.write_line = NotebookTrainingTracker_write_line(metrics)
             from transformers.trainer import DEFAULT_PROGRESS_CALLBACK
             DEFAULT_PROGRESS_CALLBACK.on_train_begin = NotebookProgressCallback_on_train_begin(metrics)
@@ -209,7 +204,6 @@ def get_trl_metrics():
     for trainer, filename in trainer_files.items():
         with open(filename, "r", encoding = "utf-8") as file: file = file.read()
 
-        # Get metrics['kl'] or stats['kl']
         metrics = re.findall(r"_?metrics\[[\"\']([^\"\']{1,})[\"\']\]", file)
         stats = re.findall(r"stats\[[\"\']([^\"\']{1,})[\"\']\]", file)
         metrics = metrics + stats
@@ -219,7 +213,6 @@ def get_trl_metrics():
         stats2 = re.findall(r"stats\[mode\]\[[\"\']([^\"\']{1,})[\"\']\]", file)
         metrics = metrics + metrics2 + stats2
 
-        # Get optional f-strings (variable at start: f"{var}suffix")
         metrics_f = re.findall(r"_?metrics\[f[\"\']\{[^\}]{1,}\}([^\"\']{1,})[\"\']\]", file)
         stats_f = re.findall(r"stats\[f[\"\']\{[^\}]{1,}\}([^\"\']{1,})[\"\']\]", file)
         metrics_f = metrics_f + stats_f
@@ -233,7 +226,6 @@ def get_trl_metrics():
         left_prefix = 'prefix = "eval_" if train_eval == "eval" else ""' in file
         if left_prefix: metrics += metrics_f
 
-        # Move all eval_ things to the end and reward to the front
         beginning = []
         middle = []
         end = []
@@ -244,7 +236,6 @@ def get_trl_metrics():
             elif x.lower().startswith("eval"):
                 end.append(x)
             else:
-                # Check if we want to move to the end
                 moved = False
                 for move_end in METRICS_MOVE_TO_END:
                     if move_end in lowered:
@@ -267,7 +258,6 @@ pass
 
 
 def PatchRLStatistics(algorithm = "grpo_trainer", other_metrics = []):
-    # Get notebook statistics columns to show up
     all_metrics = get_trl_metrics()
     if algorithm not in all_metrics:
         print(
