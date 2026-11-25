@@ -19,7 +19,6 @@ from scripts import scan_packages as sp  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# Fixture sanity.
 # ---------------------------------------------------------------------------
 
 
@@ -30,7 +29,6 @@ def test_fixture_files_exist():
 
 def test_fixture_bytes_are_deterministic(tmp_path):
     """Rebuilding the fixtures with _build.py must give byte-identical archives, since it pins member mtime, uid, gid and mode and sorts members."""
-    # Snapshot committed hashes.
     expected: dict[str, str] = {}
     for name in ("malicious_wheel.whl", "clean_wheel.whl", "malicious_sdist.tar.gz"):
         expected[name] = hashlib.sha256((FIXTURES / name).read_bytes()).hexdigest()
@@ -72,7 +70,6 @@ def test_fixture_bytes_are_deterministic(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# scan_archive() against the fixture wheel + sdist.
 # ---------------------------------------------------------------------------
 
 
@@ -112,7 +109,6 @@ def test_clean_wheel_no_findings():
 
 
 # ---------------------------------------------------------------------------
-# Fork 1 constants -- gated on availability.
 # ---------------------------------------------------------------------------
 
 
@@ -231,7 +227,6 @@ def test_archive_corruption_produces_critical_finding(tmp_path):
     )
     assert all(f.severity == sp.CRITICAL for f in corrupted)
 
-    # Same check for a corrupted tarball.
     bad_tar = tmp_path / "broken-0.0.1.tar.gz"
     bad_tar.write_bytes(b"not-a-real-gzip-stream")
     findings_tar = sp.scan_archive(str(bad_tar), "broken_fixture")

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The GRPO policy pass must keep packing and PrefixGrouper within one padded mini-batch's tokens, and keep
-PrefixGrouper off when forwards are collective (sharded FSDP2), so every rank runs the same forwards."""
+"""Packing and PrefixGrouper capped per mini-batch; off for collective forwards so ranks match."""
 
 import collections
 import importlib.util
@@ -177,9 +176,8 @@ def _collective(monkeypatch, fsdp2 = True):
 @pytest.mark.parametrize("fsdp2", [True, False], ids = ["fsdp2", "zero3"])
 @pytest.mark.parametrize("prefix_grouper", [True, False], ids = ["pg", "packing"])
 def test_rank_local_forwards_are_off_when_forwards_are_collective(monkeypatch, fsdp2, prefix_grouper):
-    """Sharded FSDP2 / ZeRO-3 forwards all-gather: a rank whose batch packs or groups would run a different number
-    of forwards than one that runs the chunked loop, and the collectives hang. The forward count must equal the
-    split count, whatever the batch looks like."""
+    """Sharded FSDP2 / ZeRO-3 forwards all-gather: a rank that packs or groups runs a different
+    forward count, so collectives hang; forward count must equal the split count for any batch."""
     if prefix_grouper:
         _prefix_grouper(monkeypatch)
     else:
