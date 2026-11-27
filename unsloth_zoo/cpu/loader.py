@@ -30,6 +30,7 @@ import weakref
 
 import torch
 from unsloth_zoo.utils import is_activation_checkpointing as _is_activation_checkpointing
+from unsloth_zoo.utils import _is_out_of_memory
 
 from unsloth_zoo.private_staging import keep_mode, precreate_private_temp
 from .runtime import available_ram, cpu_bf16_supported, cpu_bnb_4bit_supported
@@ -630,6 +631,10 @@ def _fall_back_to_eager_on_compile_error(layers):
     # its first tensor input: two checkpoints of one layer can be outstanding, and only the compiled one replays
     # compiled (an eagerly retried one must recompute eagerly).
     pending = {}
+    # id(layer) -> checkpointed forwards rerun eagerly after an out-of-memory compiled call, keyed like pending, until
+    # recomputed or their input is freed (a layer that was not really checkpointed). While any is outstanding the layer
+    # runs eagerly, as after a compile failure, so checkpoints sharing an input never mix modes; then it compiles again.
+    eager_window = {}
 
     def first_tensor(args):
         for value in args:
@@ -637,14 +642,20 @@ def _fall_back_to_eager_on_compile_error(layers):
                 return value
         return None
 
-    def remember(key, args):
+    def remember(key, args, pending = pending):
         x = first_tensor(args)
         entry = (None, None, None) if x is None else (weakref.ref(x), x.data_ptr(), tuple(x.shape))
         entries = pending.setdefault(key, [])
         entries.append(entry)
         del entries[:-64]  # forwards never backpropagated (grad-enabled eval) must not pile up
 
-    def take(key, args):
+    def window_open(key):
+        entries = eager_window.get(key)
+        if entries:
+            entries[:] = [entry for entry in entries if entry[0]() is not None]
+        return bool(entries)
+
+    def take(key, args, pending = pending):
         entries = pending.get(key)
         if not entries:
             return False
@@ -675,6 +686,12 @@ def _fall_back_to_eager_on_compile_error(layers):
         for layer in layers:
             drop(layer)
 
+    def eager_once(key, layer, args, kwargs):
+        out = layer._call_impl(*args, **kwargs)
+        if not _in_backward() and checkpointed(layer) and first_tensor(args) is not None:
+            remember(key, args, eager_window)
+        return out
+
     def checkpointed(layer):
         # Only a checkpoint opened around the layer call recomputes through it. transformers >= 5.23 checkpoints
         # inside forward instead, so the recomputation never comes back here and there is nothing to replay.
@@ -695,6 +712,11 @@ def _fall_back_to_eager_on_compile_error(layers):
                 if state["eager"]:
                     drop(_layer)
                 return _compiled(*args, **kwargs)
+            if backward and window_open(key) and take(key, args, eager_window):
+                # One of the eager out-of-memory retries recomputing: eagerly, as it ran.
+                return _layer._call_impl(*args, **kwargs)
+            if _layer.__dict__.pop("_unsloth_eager_once", False) or (not backward and window_open(key)):
+                return eager_once(key, _layer, args, kwargs)  # the restart after an out-of-memory compiled call
             if state["eager"] or _carries_cache(args, kwargs):
                 # A KV cache is mutated in place (update() appends): a compiled segment that ran before a later one
                 # failed could not be undone by a retry, so cached forwards (inference) always run eagerly.
@@ -708,6 +730,12 @@ def _fall_back_to_eager_on_compile_error(layers):
             except Exception as error:
                 if _is_control_flow(error) or isinstance(error, _RestartEagerly):
                     raise
+                if _is_out_of_memory(error):
+                    # Not a compile failure: this call reruns eagerly (restarted like below), the next one compiles.
+                    if not backward and _layer.__dict__.get("_unsloth_restart_depth", 0) > 0:
+                        _layer.__dict__["_unsloth_eager_once"] = True
+                        raise _RestartEagerly() from error
+                    return eager_once(key, _layer, args, kwargs)
                 disable(error)
                 if not backward and _layer.__dict__.get("_unsloth_restart_depth", 0) > 0:
                     # A compiled segment before a graph break may already have saved tensors into this call's
